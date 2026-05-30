@@ -128,8 +128,9 @@ def run_ctc_inference(cfg, exp_id, ckpt_path, out_dir,
         d0 = np.load(os.path.join(cache_dir, f'frame_{t:04d}.npz'))
         d1 = np.load(os.path.join(cache_dir, f'frame_{t+1:04d}.npz'))
 
-        c0, ids0, p0 = _filter_fg(d0['centers'], d0['cell_ids'], d0['patches'])
-        c1, ids1, p1 = _filter_fg(d1['centers'], d1['cell_ids'], d1['patches'])
+        # Load ALL detections (FG + BG) — no GT filter
+        c0, ids0, p0 = d0['centers'], d0['cell_ids'], d0['patches']
+        c1, ids1, p1 = d1['centers'], d1['cell_ids'], d1['patches']
 
         if len(c0) == 0 or len(c1) == 0:
             det_track.pop(t, None)
@@ -151,17 +152,23 @@ def run_ctc_inference(cfg, exp_id, ckpt_path, out_dir,
             det_track.pop(t, None)
             continue
 
-        edge_logits, mit_logits = model(
+        edge_logits, mit_logits, fg_logits, daughter_logits = model(
             torch.from_numpy(patches).to(device),
             torch.from_numpy(pos).to(device),
             torch.from_numpy(edge_index).to(device),
             torch.from_numpy(edge_feat).to(device),
         )
-        scores     = torch.sigmoid(edge_logits).cpu().numpy()
-        mit_scores = torch.sigmoid(mit_logits).cpu().numpy()  # (N0+N1,)
-        ff_int = ff.astype(np.int32)
+        scores          = torch.sigmoid(edge_logits).cpu().numpy()
+        mit_scores      = torch.sigmoid(mit_logits).cpu().numpy()
+        fg_scores       = torch.sigmoid(fg_logits).cpu().numpy()       # (N0+N1,)
+        daughter_scores = torch.sigmoid(daughter_logits).cpu().numpy() # (N0+N1,)
 
-        # --- Intra-frame union-find (score-based, no GT) ---
+        # Mark predicted-background nodes with frame flag -1 so intra_cluster
+        # and cross_frame_scores naturally ignore them.
+        ff_int = ff.astype(np.int32).copy()
+        ff_int[fg_scores < cfg.fg_threshold] = -1
+
+        # --- Intra-frame union-find (score-based, FG nodes only) ---
         cl0_g = intra_cluster(all_c, scores, edge_index, ff_int, 0, cfg.intra_threshold)
         cl1_g = intra_cluster(all_c, scores, edge_index, ff_int, 1, cfg.intra_threshold)
 
@@ -196,9 +203,14 @@ def run_ctc_inference(cfg, exp_id, ckpt_path, out_dir,
 
         det_track[t] = new_track0
 
-        # Per-cluster mitosis head score (mean over frame-t detections)
+        # Per-cluster mitosis head score (mean over frame-t nodes in cluster)
         cl0_mit = np.array([
             mit_scores[list(cl)].mean() for cl in cl0_g
+        ], dtype=np.float32)
+
+        # Per-cluster daughter head score (mean over frame-t+1 nodes in cluster)
+        cl1_daughter = np.array([
+            daughter_scores[list(cl)].mean() for cl in cl1_g
         ], dtype=np.float32)
 
         # --- Cross-frame matching ---
@@ -209,6 +221,8 @@ def run_ctc_inference(cfg, exp_id, ckpt_path, out_dir,
             mitosis_threshold=cfg.mitosis_threshold,
             cluster0_mit_scores=cl0_mit,
             mitosis_head_threshold=cfg.mitosis_head_threshold,
+            cluster1_daughter_scores=cl1_daughter,
+            daughter_head_threshold=cfg.daughter_head_threshold,
         )
 
         # --- Assign track IDs to frame-(t+1) clusters ---

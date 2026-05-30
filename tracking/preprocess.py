@@ -20,19 +20,19 @@ EXPERIMENT_DIRS = {
         det='detections/0501',
         mask='masks/20250501_click_final',
         raw='raw_imgs/0501',
-        mitosis='mitotic events/mitosis_info_0501.json',
+        mitosis='mitotic_events/mitosis_info_0501.json',
     ),
     '0507': dict(
         det='detections/0507',
         mask='masks/20250507_click_final',
         raw='raw_imgs/0507',
-        mitosis='mitotic events/mitosis_info_0507.json',
+        mitosis='mitotic_events/mitosis_info_0507.json',
     ),
     '0515': dict(
         det='detections/0515',
         mask='masks/20250515_click_final',
         raw='raw_imgs/0515',
-        mitosis='mitotic events/mitosis_info_0515.json',
+        mitosis='mitotic_events/mitosis_info_0515.json',
     ),
 }
 

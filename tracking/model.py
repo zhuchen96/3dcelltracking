@@ -135,31 +135,32 @@ class EdgeClassifier(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Mitosis head  (node-level: is this cell about to divide?)
+# Node-level binary heads
 # ---------------------------------------------------------------------------
 
-class MitosisHead(nn.Module):
-    """
-    Node-level binary classifier: P(cell is a dividing parent at this frame).
-
-    Takes the GNN-refined node feature (which encodes both 3D appearance and
-    local graph context) and predicts whether the cell is currently in mitosis.
-    Dividing cells have distinctive morphology in the H2A-mNG channel:
-    condensed/elongated chromatin before/during division.
-    """
-
+class _NodeHead(nn.Module):
     def __init__(self, node_dim):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(node_dim, node_dim // 2),
-            nn.GELU(),
-            nn.Linear(node_dim // 2, node_dim // 4),
-            nn.GELU(),
+            nn.Linear(node_dim, node_dim // 2), nn.GELU(),
+            nn.Linear(node_dim // 2, node_dim // 4), nn.GELU(),
             nn.Linear(node_dim // 4, 1),
         )
 
     def forward(self, h):
         return self.mlp(h).squeeze(-1)   # (N,) logits
+
+
+class ForegroundHead(_NodeHead):
+    """P(detection is a real foreground cell). Runs on pre-GNN CNN features."""
+
+
+class MitosisHead(_NodeHead):
+    """P(cell is a dividing parent at this frame). Runs on GNN-refined features."""
+
+
+class DaughterHead(_NodeHead):
+    """P(cell just appeared as a division daughter). Runs on GNN-refined features."""
 
 
 # ---------------------------------------------------------------------------
@@ -179,26 +180,55 @@ class TrackingNet(nn.Module):
 
     def __init__(self, feat_dim=128, gnn_layers=2, edge_dim=4, pos_dim=4):
         super().__init__()
-        self.encoder      = Encoder3D(feat_dim)
-        self.pos_enc      = nn.Linear(pos_dim, feat_dim)
-        self.gnn          = nn.ModuleList(
+        self.encoder         = Encoder3D(feat_dim)
+        self.pos_enc         = nn.Linear(pos_dim, feat_dim)
+        self.gnn             = nn.ModuleList(
             [MPNNLayer(feat_dim, edge_dim) for _ in range(gnn_layers)]
         )
-        self.classifier   = EdgeClassifier(feat_dim, edge_dim)
-        self.mitosis_head = MitosisHead(feat_dim)
+        self.classifier      = EdgeClassifier(feat_dim, edge_dim)
+        self.foreground_head = ForegroundHead(feat_dim)
+        self.mitosis_head    = MitosisHead(feat_dim)
+        self.daughter_head   = DaughterHead(feat_dim)
 
-    def forward(self, patches, positions, edge_index, edge_feat):
+    def _encode(self, patches, positions):
+        """CNN encoder + position encoding — shared first stage."""
+        return self.encoder(patches) + self.pos_enc(positions)
+
+    def forward(self, patches, positions, edge_index, edge_feat, fg_gt=None):
         """
+        Full forward pass (training + inference).
+
+        Args:
+            fg_gt : (N,) float32 GT FG labels (1=real cell, 0=BG).
+                    When provided (training), GNN sees only FG-FG edges so BG
+                    detections don't pollute context-based heads.
+                    When None (inference), predicted FG scores are used instead.
+
         Returns:
-            edge_logits    : (E,)  same-cell probability logits
-            mitosis_logits : (N,)  per-node dividing-parent logits
+            edge_logits      : (E,)  same-cell probability logits
+            mitosis_logits   : (N,)  per-node dividing-parent logits  (frame-t nodes)
+            fg_logits        : (N,)  per-node foreground logits (pre-GNN)
+            daughter_logits  : (N,)  per-node division-daughter logits (frame-t+1 nodes)
         """
-        h = self.encoder(patches) + self.pos_enc(positions)
+        h_cnn = self._encode(patches, positions)
+        fg_logits = self.foreground_head(h_cnn)   # appearance only, before GNN
 
+        # Build FG mask: use GT labels during training, predicted scores at inference
+        if fg_gt is not None:
+            fg_mask = fg_gt.bool()
+        else:
+            fg_mask = torch.sigmoid(fg_logits) >= 0.5
+
+        h = h_cnn
         if edge_index.shape[1] > 0:
+            src, dst = edge_index[0], edge_index[1]
+            fg_e  = fg_mask[src] & fg_mask[dst]   # keep only FG-FG edges for GNN
+            fg_ei = edge_index[:, fg_e]
+            fg_ef = edge_feat[fg_e]
             for layer in self.gnn:
-                h = layer(h, edge_index, edge_feat)
+                h = layer(h, fg_ei, fg_ef)
 
-        edge_logits    = self.classifier(h, edge_index, edge_feat)
-        mitosis_logits = self.mitosis_head(h)
-        return edge_logits, mitosis_logits
+        edge_logits      = self.classifier(h, edge_index, edge_feat)
+        mitosis_logits   = self.mitosis_head(h)
+        daughter_logits  = self.daughter_head(h)
+        return edge_logits, mitosis_logits, fg_logits, daughter_logits

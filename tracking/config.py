@@ -28,14 +28,20 @@ class Config:
     grad_clip: float = 1.0
 
     # Loss weights
-    mitosis_loss_weight: float = 2.0   # weight of mitosis head loss vs edge loss
-    mitosis_pos_weight: float = 20.0   # heavy upweight for rare dividing-parent class
+    mitosis_loss_weight: float = 5.0    # weight of mitosis head loss vs edge loss
+    mitosis_pos_weight: float = 20.0    # heavy upweight for rare dividing-parent class
+    daughter_loss_weight: float = 5.0   # weight of daughter head loss
+    daughter_pos_weight: float = 20.0   # same rarity as mother — ~2 per frame pair
+    fg_loss_weight: float = 1.0         # weight of foreground head loss
+    fg_pos_weight: float = 3.0          # FG:BG ratio ~1:2.3
 
     # Inference thresholds
-    intra_threshold: float = 0.3    # merge same-frame detections of the same cell
-    cross_threshold: float = 0.5    # cross-frame link threshold
-    mitosis_threshold: float = 0.4  # both daughters must score >= this to call division
-    mitosis_head_threshold: float = 0.3  # sigmoid threshold for mitosis head prediction
+    intra_threshold: float = 0.3          # merge same-frame detections of the same cell
+    cross_threshold: float = 0.5          # cross-frame link threshold
+    mitosis_threshold: float = 0.4        # affinity threshold for second daughter candidate
+    mitosis_head_threshold: float = 0.3   # sigmoid threshold for mitosis head (mother)
+    daughter_head_threshold: float = 0.1  # sigmoid threshold for daughter head (soft gate)
+    fg_threshold: float = 0.5             # sigmoid threshold for foreground head at inference
 
     # Data splits
     train_exps: Tuple[str, ...] = ('0501', '0507')

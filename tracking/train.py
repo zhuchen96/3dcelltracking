@@ -46,17 +46,19 @@ def focal_bce(logits, labels, valid, pos_weight, gamma=2.0):
 
 @torch.no_grad()
 def eval_edges(model, dataset, device, cfg):
-    """Compute edge P/R/F1 and mitosis P/R/F1 on a dataset."""
+    """Compute edge/mitosis/daughter/fg P/R/F1 on a dataset."""
     model.eval()
     tp = fp = fn = 0
     mit_tp = mit_fp = mit_fn = 0
+    dau_tp = dau_fp = dau_fn = 0
+    fg_tp  = fg_fp  = fg_fn  = 0
     for item in dataset:
         if item is None:
             continue
         out = forward_item(model, item, device)
         if out is None:
             continue
-        edge_logits, mit_logits = out
+        edge_logits, mit_logits, fg_logits, daughter_logits = out
 
         valid = item['valid'].to(device)
         if valid.sum() > 0:
@@ -68,32 +70,54 @@ def eval_edges(model, dataset, device, cfg):
 
         vm = item['valid_mitosis'].to(device)
         if vm.sum() > 0:
-            mp   = (torch.sigmoid(mit_logits[vm]) >= cfg.mitosis_head_threshold).float()
-            mt   = item['mitosis_labels'].to(device)[vm]
+            mp = (torch.sigmoid(mit_logits[vm]) >= cfg.mitosis_head_threshold).float()
+            mt = item['mitosis_labels'].to(device)[vm]
             mit_tp += ((mp == 1) & (mt == 1)).sum().item()
             mit_fp += ((mp == 1) & (mt == 0)).sum().item()
             mit_fn += ((mp == 0) & (mt == 1)).sum().item()
 
-    prec = tp / (tp + fp + 1e-8)
-    rec  = tp / (tp + fn + 1e-8)
-    f1   = 2 * prec * rec / (prec + rec + 1e-8)
-    mp   = mit_tp / (mit_tp + mit_fp + 1e-8)
-    mr   = mit_tp / (mit_tp + mit_fn + 1e-8)
-    mf1  = 2 * mp * mr / (mp + mr + 1e-8)
+        vd = item['valid_daughter'].to(device)
+        if vd.sum() > 0:
+            dp = (torch.sigmoid(daughter_logits[vd]) >= cfg.daughter_head_threshold).float()
+            dt = item['daughter_labels'].to(device)[vd]
+            dau_tp += ((dp == 1) & (dt == 1)).sum().item()
+            dau_fp += ((dp == 1) & (dt == 0)).sum().item()
+            dau_fn += ((dp == 0) & (dt == 1)).sum().item()
+
+        vf = item['valid_fg'].to(device)
+        if vf.sum() > 0:
+            fp2 = (torch.sigmoid(fg_logits[vf]) >= cfg.fg_threshold).float()
+            ft  = item['fg_labels'].to(device)[vf]
+            fg_tp += ((fp2 == 1) & (ft == 1)).sum().item()
+            fg_fp += ((fp2 == 1) & (ft == 0)).sum().item()
+            fg_fn += ((fp2 == 0) & (ft == 1)).sum().item()
+
+    def prf(tp_, fp_, fn_):
+        p = tp_ / (tp_ + fp_ + 1e-8)
+        r = tp_ / (tp_ + fn_ + 1e-8)
+        return p, r, 2 * p * r / (p + r + 1e-8)
+
+    prec, rec, f1  = prf(tp, fp, fn)
+    mp,   mr,  mf1 = prf(mit_tp, mit_fp, mit_fn)
+    dp,   dr,  df1 = prf(dau_tp, dau_fp, dau_fn)
+    fp_,  fr,  ff1 = prf(fg_tp,  fg_fp,  fg_fn)
     return dict(precision=prec, recall=rec, f1=f1, tp=tp, fp=fp, fn=fn,
-                mit_p=mp, mit_r=mr, mit_f1=mf1)
+                mit_p=mp,  mit_r=mr,  mit_f1=mf1,
+                dau_p=dp,  dau_r=dr,  dau_f1=df1,
+                fg_p=fp_,  fg_r=fr,   fg_f1=ff1)
 
 
 def forward_item(model, item, device):
-    """Run one forward pass; returns (edge_logits, mitosis_logits) or None."""
+    """Run one forward pass; returns (edge_logits, mitosis_logits, fg_logits) or None."""
     patches    = item['patches'].to(device)
     positions  = item['positions'].to(device)
     edge_index = item['edge_index'].to(device)
     edge_feat  = item['edge_feat'].to(device)
+    fg_gt      = item['fg_labels'].to(device)   # GT mask for GNN edge filtering
 
     if edge_index.shape[1] == 0:
         return None
-    return model(patches, positions, edge_index, edge_feat)
+    return model(patches, positions, edge_index, edge_feat, fg_gt=fg_gt)
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +157,7 @@ def train(cfg: Config):
                                 weight_decay=cfg.weight_decay)
     sched  = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg.epochs)
 
-    ckpt_dir = os.path.join(cfg.cache_dir, 'checkpoints_cpu')
+    ckpt_dir = os.path.join(cfg.cache_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
     log_path = os.path.join(ckpt_dir, 'log.jsonl')
 
@@ -148,7 +172,7 @@ def train(cfg: Config):
                 out = forward_item(model, item, device)
                 if out is None:
                     continue
-                edge_logits, mit_logits = out
+                edge_logits, mit_logits, fg_logits, daughter_logits = out
 
                 edge_loss = focal_bce(
                     edge_logits,
@@ -162,7 +186,22 @@ def train(cfg: Config):
                     item['valid_mitosis'].to(device),
                     cfg.mitosis_pos_weight,
                 )
-                loss = edge_loss + cfg.mitosis_loss_weight * mit_loss
+                daughter_loss = focal_bce(
+                    daughter_logits,
+                    item['daughter_labels'].to(device),
+                    item['valid_daughter'].to(device),
+                    cfg.daughter_pos_weight,
+                )
+                fg_loss = focal_bce(
+                    fg_logits,
+                    item['fg_labels'].to(device),
+                    item['valid_fg'].to(device),
+                    cfg.fg_pos_weight,
+                )
+                loss = (edge_loss
+                        + cfg.mitosis_loss_weight  * mit_loss
+                        + cfg.daughter_loss_weight * daughter_loss
+                        + cfg.fg_loss_weight       * fg_loss)
 
                 if loss.requires_grad:
                     optim.zero_grad()
@@ -178,12 +217,10 @@ def train(cfg: Config):
             val_metrics = eval_edges(model, val_ds, device, cfg)
             f1 = val_metrics['f1']
             print(f'Epoch {epoch:4d} | loss {avg_loss:.4f} | '
-                  f'edge P={val_metrics["precision"]:.3f} '
-                  f'R={val_metrics["recall"]:.3f} '
-                  f'F1={f1:.3f} | '
-                  f'mit P={val_metrics["mit_p"]:.3f} '
-                  f'R={val_metrics["mit_r"]:.3f} '
-                  f'F1={val_metrics["mit_f1"]:.3f}')
+                  f'edge F1={f1:.3f} | '
+                  f'mit F1={val_metrics["mit_f1"]:.3f} | '
+                  f'dau F1={val_metrics["dau_f1"]:.3f} | '
+                  f'fg F1={val_metrics["fg_f1"]:.3f}')
 
             log_entry = dict(epoch=epoch, loss=avg_loss, **val_metrics)
             with open(log_path, 'a') as fh:

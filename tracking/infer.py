@@ -131,16 +131,25 @@ def cross_frame_scores(clusters0, clusters1, scores, edge_index):
 def match_cross_frame(aff, clusters0, clusters1, reps0, reps1,
                       threshold, r_cross, z_anisotropy,
                       mitosis_threshold=None,
-                      cluster0_mit_scores=None, mitosis_head_threshold=0.5):
+                      cluster0_mit_scores=None, mitosis_head_threshold=0.5,
+                      cluster1_daughter_scores=None, daughter_head_threshold=0.1):
     """
     1-to-1 or 1-to-2 (mitosis) matching.
 
-    threshold              : minimum affinity for a normal 1-to-1 link.
-    mitosis_threshold      : minimum edge affinity for BOTH daughters to call a division.
-    cluster0_mit_scores    : (K0,) float array of per-cluster mitosis head scores.
-                             When provided, mitosis is only allowed for clusters
-                             whose score >= mitosis_head_threshold.
-    mitosis_head_threshold : sigmoid threshold for the morphology-based mitosis head.
+    A division is called when ALL three signals agree:
+      1. Edge topology : mother → first daughter >= threshold (via Hungarian);
+                        mother → second daughter >= mitosis_threshold
+      2. Mother head   : cluster0_mit_scores[k0] >= mitosis_head_threshold
+      3. Daughter head : both daughters >= daughter_head_threshold (soft gate)
+
+    Args:
+        threshold                : minimum affinity for normal 1-to-1 linking.
+        mitosis_threshold        : affinity threshold for the second daughter candidate.
+                                   Defaults to threshold if not set.
+        cluster0_mit_scores      : (K0,) per-cluster mother mitosis head scores.
+        mitosis_head_threshold   : gate on mother morphology head.
+        cluster1_daughter_scores : (K1,) per-cluster daughter head scores.
+        daughter_head_threshold  : soft gate on both daughters' morphology head.
 
     Returns list of (k0, [k1, ...]) assignment tuples.
     """
@@ -168,16 +177,21 @@ def match_cross_frame(aff, clusters0, clusters1, reps0, reps1,
     used_k1 = set(matches_1to1.values())
     assignments = []
     for k0, k1 in matches_1to1.items():
-        # Gate mitosis: require both edge score threshold AND morphology head score
-        morphology_ok = (
+        mother_ok = (
             cluster0_mit_scores is None or
             float(cluster0_mit_scores[k0]) >= mitosis_head_threshold
         )
-        if morphology_ok and aff[k0, k1] >= mitosis_threshold:
+        k1_daughter_ok = (
+            cluster1_daughter_scores is None or
+            float(cluster1_daughter_scores[k1]) >= daughter_head_threshold
+        )
+        if mother_ok and k1_daughter_ok and aff[k0, k1] >= mitosis_threshold:
             second_candidates = [
                 k1b for k1b in range(K1)
                 if k1b != k1 and k1b not in used_k1
                 and aff[k0, k1b] >= mitosis_threshold
+                and (cluster1_daughter_scores is None or
+                     float(cluster1_daughter_scores[k1b]) >= daughter_head_threshold)
             ]
         else:
             second_candidates = []

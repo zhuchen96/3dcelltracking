@@ -133,9 +133,9 @@ class TrackingDataset(Dataset):
     """
 
     MITOSIS_PATHS = {
-        '0501': 'mitotic events/mitosis_info_0501.json',
-        '0507': 'mitotic events/mitosis_info_0507.json',
-        '0515': 'mitotic events/mitosis_info_0515.json',
+        '0501': 'mitotic_events/mitosis_info_0501.json',
+        '0507': 'mitotic_events/mitosis_info_0507.json',
+        '0515': 'mitotic_events/mitosis_info_0515.json',
     }
 
     def __init__(self, exp_ids, data_root, cache_dir,
@@ -162,14 +162,11 @@ class TrackingDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load_frame(self, exp, t, labeled_only=True):
+    def _load_frame(self, exp, t):
+        """Load all detections (FG + BG) for a frame."""
         path = os.path.join(self.cache_dir, exp, f'frame_{t:04d}.npz')
         data = np.load(path)
-        centers, ids, patches = data['centers'], data['cell_ids'], data['patches']
-        if labeled_only and len(centers) > 0:
-            mask = ids > 0
-            centers, ids, patches = centers[mask], ids[mask], patches[mask]
-        return centers, ids, patches
+        return data['centers'], data['cell_ids'], data['patches']
 
     def __getitem__(self, idx):
         exp, t = self.samples[idx]
@@ -211,19 +208,44 @@ class TrackingDataset(Dataset):
         valid_mitosis = np.zeros(N0 + N1, dtype=bool)
         valid_mitosis[:N0] = (ids0 > 0)
 
+        # --- Foreground node labels ---
+        all_ids = np.concatenate([ids0, ids1])
+        fg_labels = (all_ids > 0).astype(np.float32)
+        valid_fg  = np.ones(N0 + N1, dtype=bool)
+
+        # --- Daughter node labels ---
+        # A frame-(t+1) node is a daughter if its cell_id appears in the
+        # children list of a parent whose LastFrame == t.
+        daughter_ids = set()
+        for pid, pinfo in parents.items():
+            if pinfo['LastFrame'] == t:
+                for did in p2c.get(pid, []):
+                    daughter_ids.add(did)
+        daughter_labels = np.zeros(N0 + N1, dtype=np.float32)
+        for i, cid in enumerate(ids1):
+            if int(cid) in daughter_ids:
+                daughter_labels[N0 + i] = 1.0
+        # Frame-t nodes are never daughters; only GT frame-(t+1) nodes contribute.
+        valid_daughter = np.zeros(N0 + N1, dtype=bool)
+        valid_daughter[N0:] = (ids1 > 0)
+
         return dict(
-            patches        = torch.from_numpy(all_patches),
-            positions      = torch.from_numpy(positions),
-            edge_index     = torch.from_numpy(edge_index),
-            edge_feat      = torch.from_numpy(edge_feat),
-            labels         = torch.from_numpy(labels),
-            valid          = torch.from_numpy(valid),
-            mitosis_labels = torch.from_numpy(mitosis_labels),
-            valid_mitosis  = torch.from_numpy(valid_mitosis),
-            frame_flags    = torch.from_numpy(frame_flags).long(),
-            N0             = N0,
-            exp            = exp,
-            t              = t,
+            patches          = torch.from_numpy(all_patches),
+            positions        = torch.from_numpy(positions),
+            edge_index       = torch.from_numpy(edge_index),
+            edge_feat        = torch.from_numpy(edge_feat),
+            labels           = torch.from_numpy(labels),
+            valid            = torch.from_numpy(valid),
+            mitosis_labels   = torch.from_numpy(mitosis_labels),
+            valid_mitosis    = torch.from_numpy(valid_mitosis),
+            fg_labels        = torch.from_numpy(fg_labels),
+            valid_fg         = torch.from_numpy(valid_fg),
+            daughter_labels  = torch.from_numpy(daughter_labels),
+            valid_daughter   = torch.from_numpy(valid_daughter),
+            frame_flags      = torch.from_numpy(frame_flags).long(),
+            N0               = N0,
+            exp              = exp,
+            t                = t,
         )
 
 
