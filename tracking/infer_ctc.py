@@ -80,6 +80,48 @@ def _draw_ellipsoid(mask, center_zyx, radius_zyx, value):
     mask[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi][inside] = np.uint16(value)
 
 
+def _rescue_daughters(assignments, aff, reps1, cl0_mit,
+                      img_H, img_W, margin, mit_head_threshold):
+    """
+    Rescue pass: interior unmatched t+1 clusters must be daughters.
+
+    For each unmatched cluster at t+1 whose representative is far from the
+    YX image border (> margin px), find the best mother candidate among
+    already-matched t clusters and promote the link to a division.
+
+    Only considers t clusters that:
+      - Are currently 1-to-1 matched (not already a division)
+      - Have mitosis head score >= mit_head_threshold
+      - Have any positive affinity to the unmatched cluster
+    """
+    matched_k1 = {k1 for _, k1s in assignments for k1 in k1s}
+    assignments = {k0: list(k1s) for k0, k1s in assignments}  # mutable copy
+
+    for k1 in range(len(reps1)):
+        if k1 in matched_k1:
+            continue
+        y, x = reps1[k1][1], reps1[k1][2]
+        if y < margin or y > img_H - margin or x < margin or x > img_W - margin:
+            continue  # near border — could be a cell entering the field of view
+
+        # Interior unmatched → look for a mother candidate
+        best_k0, best_aff = -1, 0.0
+        for k0, k1s in assignments.items():
+            if len(k1s) != 1:                          # skip already-divisions
+                continue
+            if float(cl0_mit[k0]) < mit_head_threshold:
+                continue
+            if aff[k0, k1] > best_aff:
+                best_aff = aff[k0, k1]
+                best_k0 = k0
+
+        if best_k0 >= 0 and best_aff > 0:
+            assignments[best_k0].append(k1)
+            matched_k1.add(k1)
+
+    return list(assignments.items())
+
+
 # ---------------------------------------------------------------------------
 # Main inference
 # ---------------------------------------------------------------------------
@@ -267,6 +309,25 @@ def run_ctc_inference(cfg, exp_id, ckpt_path, out_dir,
             print(f'  pair {t}/{n_frames-1}: '
                   f'det={N0}/{N1}  cl={len(cl0_g)}/{len(cl1_g)}  '
                   f'matched={len(assignments)}  mitoses={n_mit}')
+
+    # -----------------------------------------------------------------------
+    # Minimum track length filter: drop short spurious tracks.
+    # Daughter tracks (parent > 0) are always kept regardless of length.
+    # Parents of kept daughters are also kept.
+    # -----------------------------------------------------------------------
+    if cfg.min_track_length > 1:
+        keep = {tid for tid, m in track_meta.items()
+                if (m['last'] - m['first'] + 1 >= cfg.min_track_length)
+                or m['parent'] > 0}
+        # keep parents of any retained daughter track
+        keep |= {track_meta[tid]['parent']
+                 for tid in keep if track_meta[tid]['parent'] > 0}
+        track_meta = {tid: m for tid, m in track_meta.items() if tid in keep}
+        frame_clusters = {t: [(tid, rep) for tid, rep in fc if tid in keep]
+                          for t, fc in frame_clusters.items()}
+        n_removed = next_tid - 1 - len(track_meta)
+        print(f'  Removed {n_removed} short tracks (length < {cfg.min_track_length}), '
+              f'{len(track_meta)} remain.')
 
     # -----------------------------------------------------------------------
     # Write CTC mask TIFFs: draw ellipsoid at each cluster representative

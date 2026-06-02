@@ -21,8 +21,9 @@ from tracking.model import TrackingNet
 # Loss
 # ---------------------------------------------------------------------------
 
-def focal_bce(logits, labels, valid, pos_weight, gamma=2.0):
-    """Focal BCE loss on valid subset. pos_weight upweights the positive class."""
+def focal_bce(logits, labels, valid, pos_weight, gamma=2.0, sample_weights=None):
+    """Focal BCE loss on valid subset. pos_weight upweights the positive class.
+    sample_weights: optional (N,) per-node multiplier applied after focal weighting."""
     if valid.sum() == 0:
         return logits.sum() * 0.0
 
@@ -37,7 +38,10 @@ def focal_bce(logits, labels, valid, pos_weight, gamma=2.0):
     p     = torch.sigmoid(l)
     pt    = torch.where(y == 1, p, 1 - p)
     focal = (1 - pt) ** gamma
-    return (focal * bce).mean()
+    loss  = focal * bce
+    if sample_weights is not None:
+        loss = loss * sample_weights[valid]
+    return loss.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -107,17 +111,22 @@ def eval_edges(model, dataset, device, cfg):
                 fg_p=fp_,  fg_r=fr,   fg_f1=ff1)
 
 
-def forward_item(model, item, device):
-    """Run one forward pass; returns (edge_logits, mitosis_logits, fg_logits) or None."""
+def forward_item(model, item, device, use_gt_topology=False):
+    """Run one forward pass; returns 4-tuple of logits or None."""
     patches    = item['patches'].to(device)
     positions  = item['positions'].to(device)
     edge_index = item['edge_index'].to(device)
     edge_feat  = item['edge_feat'].to(device)
-    fg_gt      = item['fg_labels'].to(device)   # GT mask for GNN edge filtering
+    fg_gt      = item['fg_labels'].to(device)
 
     if edge_index.shape[1] == 0:
         return None
-    return model(patches, positions, edge_index, edge_feat, fg_gt=fg_gt)
+
+    gt_labels = item['labels'].to(device) if use_gt_topology else None
+    gt_valid  = item['valid'].to(device)  if use_gt_topology else None
+
+    return model(patches, positions, edge_index, edge_feat,
+                 fg_gt=fg_gt, gt_labels=gt_labels, gt_valid=gt_valid)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +178,7 @@ def train(cfg: Config):
 
         for batch in train_loader:
             for item in batch:          # batch size is 1; item is a single dict
-                out = forward_item(model, item, device)
+                out = forward_item(model, item, device, use_gt_topology=True)
                 if out is None:
                     continue
                 edge_logits, mit_logits, fg_logits, daughter_logits = out
@@ -191,6 +200,7 @@ def train(cfg: Config):
                     item['daughter_labels'].to(device),
                     item['valid_daughter'].to(device),
                     cfg.daughter_pos_weight,
+                    sample_weights=item['daughter_weights'].to(device),
                 )
                 fg_loss = focal_bce(
                     fg_logits,

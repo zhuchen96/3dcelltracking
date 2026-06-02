@@ -136,20 +136,24 @@ def match_cross_frame(aff, clusters0, clusters1, reps0, reps1,
     """
     1-to-1 or 1-to-2 (mitosis) matching.
 
-    A division is called when ALL three signals agree:
-      1. Edge topology : mother → first daughter >= threshold (via Hungarian);
-                        mother → second daughter >= mitosis_threshold
-      2. Mother head   : cluster0_mit_scores[k0] >= mitosis_head_threshold
-      3. Daughter head : both daughters >= daughter_head_threshold (soft gate)
+    Division detection uses a pre-pass that reserves both daughters BEFORE
+    running the 1-to-1 Hungarian, preventing the second daughter from being
+    consumed by an unrelated 1-to-1 match.
+
+    A division candidate (k0, k1a, k1b) is accepted when:
+      1. Mother head   : cluster0_mit_scores[k0] >= mitosis_head_threshold
+      2. Edge topology : aff[k0, k1a] >= mitosis_threshold
+                        aff[k0, k1b] >= mitosis_threshold
+      3. Daughter head : (optional) both daughters >= daughter_head_threshold
 
     Args:
         threshold                : minimum affinity for normal 1-to-1 linking.
-        mitosis_threshold        : affinity threshold for the second daughter candidate.
+        mitosis_threshold        : affinity threshold for both daughter candidates.
                                    Defaults to threshold if not set.
         cluster0_mit_scores      : (K0,) per-cluster mother mitosis head scores.
-        mitosis_head_threshold   : gate on mother morphology head.
+        mitosis_head_threshold   : gate on mother head score.
         cluster1_daughter_scores : (K1,) per-cluster daughter head scores.
-        daughter_head_threshold  : soft gate on both daughters' morphology head.
+        daughter_head_threshold  : soft gate on both daughters' head scores.
 
     Returns list of (k0, [k1, ...]) assignment tuples.
     """
@@ -160,48 +164,60 @@ def match_cross_frame(aff, clusters0, clusters1, reps0, reps1,
     if K0 == 0 or K1 == 0:
         return []
 
-    # 1-to-1 Hungarian on cost = 1 - affinity (only within r_cross)
-    cost = 1.0 - aff.copy()
     sc0 = reps0.copy(); sc0[:, 0] *= z_anisotropy
     sc1 = reps1.copy(); sc1[:, 0] *= z_anisotropy
     dist_matrix = np.linalg.norm(sc0[:, None] - sc1[None], axis=-1)
+
+    cost = 1.0 - aff.copy()
     cost[dist_matrix > r_cross] = 1.0
 
-    row_ind, col_ind = linear_sum_assignment(cost)
+    # --- Pre-pass: identify and reserve division assignments ---
+    # Process mothers in decreasing mit_score order so the most confident
+    # divisions claim their daughters before less certain ones.
+    reserved_k0 = set()
+    reserved_k1 = set()
+    division_assignments = []
 
-    matches_1to1 = {}
-    for r, c in zip(row_ind, col_ind):
-        if aff[r, c] >= threshold:
-            matches_1to1[r] = c
+    if cluster0_mit_scores is not None:
+        k0_order = sorted(range(K0), key=lambda x: -float(cluster0_mit_scores[x]))
+        for k0 in k0_order:
+            if float(cluster0_mit_scores[k0]) < mitosis_head_threshold:
+                break
+            # Find top-2 eligible daughters for this mother
+            candidates = []
+            for k1 in range(K1):
+                if k1 in reserved_k1:
+                    continue
+                if dist_matrix[k0, k1] > r_cross:
+                    continue
+                if aff[k0, k1] < mitosis_threshold:
+                    continue
+                if (cluster1_daughter_scores is not None and
+                        float(cluster1_daughter_scores[k1]) < daughter_head_threshold):
+                    continue
+                candidates.append((aff[k0, k1], k1))
+            if len(candidates) >= 2:
+                candidates.sort(reverse=True)
+                k1a, k1b = candidates[0][1], candidates[1][1]
+                division_assignments.append((k0, [k1a, k1b]))
+                reserved_k0.add(k0)
+                reserved_k1.add(k1a)
+                reserved_k1.add(k1b)
 
-    used_k1 = set(matches_1to1.values())
-    assignments = []
-    for k0, k1 in matches_1to1.items():
-        mother_ok = (
-            cluster0_mit_scores is None or
-            float(cluster0_mit_scores[k0]) >= mitosis_head_threshold
-        )
-        k1_daughter_ok = (
-            cluster1_daughter_scores is None or
-            float(cluster1_daughter_scores[k1]) >= daughter_head_threshold
-        )
-        if mother_ok and k1_daughter_ok and aff[k0, k1] >= mitosis_threshold:
-            second_candidates = [
-                k1b for k1b in range(K1)
-                if k1b != k1 and k1b not in used_k1
-                and aff[k0, k1b] >= mitosis_threshold
-                and (cluster1_daughter_scores is None or
-                     float(cluster1_daughter_scores[k1b]) >= daughter_head_threshold)
-            ]
-        else:
-            second_candidates = []
+    # --- 1-to-1 Hungarian on remaining (non-reserved) clusters ---
+    rem_k0 = [k for k in range(K0) if k not in reserved_k0]
+    rem_k1 = [k for k in range(K1) if k not in reserved_k1]
 
-        if second_candidates:
-            k1b = max(second_candidates, key=lambda x: aff[k0, x])
-            assignments.append((k0, [k1, k1b]))
-            used_k1.add(k1b)
-        else:
-            assignments.append((k0, [k1]))
+    assignments = list(division_assignments)
+    if rem_k0 and rem_k1:
+        rk0 = np.array(rem_k0)
+        rk1 = np.array(rem_k1)
+        sub_cost = cost[np.ix_(rk0, rk1)]
+        row_ind, col_ind = linear_sum_assignment(sub_cost)
+        for r, c in zip(row_ind, col_ind):
+            k0, k1 = int(rk0[r]), int(rk1[c])
+            if aff[k0, k1] >= threshold:
+                assignments.append((k0, [k1]))
 
     return assignments
 

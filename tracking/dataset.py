@@ -208,6 +208,18 @@ class TrackingDataset(Dataset):
         valid_mitosis = np.zeros(N0 + N1, dtype=bool)
         valid_mitosis[:N0] = (ids0 > 0)
 
+        # Mine additional dividing-parent labels from edge structure:
+        # any frame-t node with 2+ cross-frame GT label=1 edges is a dividing
+        # parent by definition, even if the mitosis JSON missed it.
+        cross_pos = np.zeros(N0, dtype=np.int32)
+        for e_idx in range(edge_index.shape[1]):
+            s, d = int(edge_index[0, e_idx]), int(edge_index[1, e_idx])
+            if s < N0 and d >= N0 and valid[e_idx] and labels[e_idx] > 0.5:
+                cross_pos[s] += 1
+        extra = np.where(cross_pos >= 2)[0]
+        mitosis_labels[extra] = 1.0
+        valid_mitosis[extra]  = True
+
         # --- Foreground node labels ---
         all_ids = np.concatenate([ids0, ids1])
         fg_labels = (all_ids > 0).astype(np.float32)
@@ -229,6 +241,55 @@ class TrackingDataset(Dataset):
         valid_daughter = np.zeros(N0 + N1, dtype=bool)
         valid_daughter[N0:] = (ids1 > 0)
 
+        # --- Sister edge labels (for SimpleTrackingNet) ---
+        # Two frame-(t+1) detections are sisters if they are both daughters
+        # of the SAME parent that divided at this transition.
+        # Sisters look alike (same genetic material, similar size) and are
+        # spatially close — a much more specific signal than the mother head.
+        # valid_sister: only intra-frame t+1 edges with GT labels on both ends.
+        dau_to_parent_this_t = {}
+        for pid, pinfo in parents.items():
+            if pinfo['LastFrame'] == t:
+                for did in p2c.get(pid, []):
+                    dau_to_parent_this_t[did] = pid
+
+        sister_labels = np.zeros(edge_index.shape[1], dtype=np.float32)
+        valid_sister  = np.zeros(edge_index.shape[1], dtype=bool)
+        for e_idx in range(edge_index.shape[1]):
+            s, d = int(edge_index[0, e_idx]), int(edge_index[1, e_idx])
+            if s >= N0 and d >= N0:               # both in frame t+1
+                cid_s = int(all_ids[s])
+                cid_d = int(all_ids[d])
+                if cid_s > 0 and cid_d > 0:
+                    valid_sister[e_idx] = True
+                    if (cid_s in dau_to_parent_this_t
+                            and cid_d in dau_to_parent_this_t
+                            and dau_to_parent_this_t[cid_s] == dau_to_parent_this_t[cid_d]):
+                        sister_labels[e_idx] = 1.0
+
+        # --- Broken-track weights for daughter loss ---
+        # Using the biological prior "no new cells in the interior except daughters":
+        # a frame-(t+1) GT node whose cell_id was present at frame t-1 but absent
+        # at frame t is definitively a broken track (detection failure at t), NOT a
+        # daughter. Upweighting these as hard negatives sharpens the daughter head's
+        # decision boundary without requiring any unsafe inference-time assumptions.
+        daughter_weights = np.ones(N0 + N1, dtype=np.float32)
+        if t > 0:
+            prev_path = os.path.join(self.cache_dir, exp, f'frame_{t-1:04d}.npz')
+            try:
+                ids_prev = np.load(prev_path)['cell_ids']
+                prev_cell_ids  = set(int(x) for x in ids_prev if x > 0)
+                frame_t_cell_ids = set(int(x) for x in ids0 if x > 0)
+                for i, cid in enumerate(ids1):
+                    cid = int(cid)
+                    if (cid > 0
+                            and cid not in daughter_ids
+                            and cid in prev_cell_ids
+                            and cid not in frame_t_cell_ids):
+                        daughter_weights[N0 + i] = 3.0
+            except FileNotFoundError:
+                pass
+
         return dict(
             patches          = torch.from_numpy(all_patches),
             positions        = torch.from_numpy(positions),
@@ -242,6 +303,9 @@ class TrackingDataset(Dataset):
             valid_fg         = torch.from_numpy(valid_fg),
             daughter_labels  = torch.from_numpy(daughter_labels),
             valid_daughter   = torch.from_numpy(valid_daughter),
+            daughter_weights = torch.from_numpy(daughter_weights),
+            sister_labels    = torch.from_numpy(sister_labels),
+            valid_sister     = torch.from_numpy(valid_sister),
             frame_flags      = torch.from_numpy(frame_flags).long(),
             N0               = N0,
             exp              = exp,
