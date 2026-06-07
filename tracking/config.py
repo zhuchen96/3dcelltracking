@@ -46,6 +46,10 @@ class Config:
     fg_threshold: float = 0.5             # sigmoid threshold for foreground head at inference
     rescue_margin: int = 30               # YX pixels from border; interior unmatched t+1 clusters are rescued as daughters
     min_track_length: int = 5             # drop tracks shorter than this (frames); keeps daughters regardless
+    phantom_max_frames: int = 2           # max frames a phantom node persists before the track ends
+
+    # Training augmentation
+    aug_drop_prob: float = 0.0            # probability of dropping an FG node during training (0 = off)
 
     # Data splits
     train_exps: Tuple[str, ...] = ('0501', '0507')

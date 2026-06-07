@@ -33,8 +33,79 @@ from scipy.optimize import linear_sum_assignment
 from tracking.config import Config
 from tracking.dataset import _build_graph, _scale
 from tracking.model import SimpleTrackingNet
-from tracking.infer import intra_cluster, cluster_representative, cross_frame_scores
 from tracking.preprocess import EXPERIMENT_DIRS, sorted_tifs
+
+
+# ---------------------------------------------------------------------------
+# Union-Find (for intra-frame clustering)
+# ---------------------------------------------------------------------------
+
+class _UF:
+    def __init__(self, n):
+        self.parent = list(range(n))
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def intra_cluster(centers, scores, edge_index, frame_flags, frame_id, threshold):
+    """Cluster detections within one frame using high-scoring intra-frame edges."""
+    node_mask  = (frame_flags == frame_id)
+    global_idx = np.where(node_mask)[0]
+    n_local    = len(global_idx)
+    if n_local == 0:
+        return []
+    g2l = {g: l for l, g in enumerate(global_idx)}
+    uf  = _UF(n_local)
+    src, dst = edge_index[0], edge_index[1]
+    for e in range(len(scores)):
+        s, d = int(src[e]), int(dst[e])
+        if frame_flags[s] != frame_id or frame_flags[d] != frame_id:
+            continue
+        if scores[e] >= threshold:
+            uf.union(g2l[s], g2l[d])
+    clusters = {}
+    for l, g in enumerate(global_idx):
+        clusters.setdefault(uf.find(l), []).append(g)
+    return list(clusters.values())
+
+
+def cluster_representative(clusters, centers):
+    """Mean ZYX position for each cluster."""
+    return np.array([centers[c].mean(0) for c in clusters])
+
+
+def cross_frame_scores(clusters0, clusters1, scores, edge_index):
+    """Mean edge probability between each pair of (frame-t, frame-t+1) clusters."""
+    K0, K1 = len(clusters0), len(clusters1)
+    if K0 == 0 or K1 == 0:
+        return np.zeros((K0, K1))
+    set0 = [set(c) for c in clusters0]
+    set1 = [set(c) for c in clusters1]
+    aff  = np.zeros((K0, K1))
+    cnt  = np.zeros((K0, K1))
+    src, dst = edge_index[0], edge_index[1]
+    for e in range(len(scores)):
+        s, d = int(src[e]), int(dst[e])
+        for k0, s0 in enumerate(set0):
+            if s in s0:
+                for k1, s1 in enumerate(set1):
+                    if d in s1:
+                        aff[k0, k1] += scores[e]
+                        cnt[k0, k1] += 1
+                        break
+                break
+    mask = cnt > 0
+    aff[mask] /= cnt[mask]
+    return aff
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +248,9 @@ def _cluster_local(clusters_global, offset):
 
 
 def _cluster_tid(cluster_local, det_track):
-    tids = [int(det_track[i]) for i in cluster_local if det_track[i] > 0]
+    # Bounds-check guards against phantom node indices that exceed det_track size.
+    tids = [int(det_track[i]) for i in cluster_local
+            if i < len(det_track) and det_track[i] > 0]
     return Counter(tids).most_common(1)[0][0] if tids else 0
 
 
@@ -230,6 +303,11 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
     track_meta     = {}
     next_tid       = 1
 
+    # Phantom node state
+    # phantom_pool[tid] = {pos, h_feat, vel, frames_remaining}
+    phantom_pool    = {}
+    prev_track_reps = {}   # tid -> last known ZYX position (for velocity)
+
     for t in range(n_frames - 1):
         d0 = np.load(os.path.join(cache_dir, f'frame_{t:04d}.npz'))
         d1 = np.load(os.path.join(cache_dir, f'frame_{t+1:04d}.npz'))
@@ -239,26 +317,55 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
 
         if len(c0) == 0 or len(c1) == 0:
             det_track.pop(t, None)
+            phantom_pool.clear()
             continue
 
-        N0, N1 = len(c0), len(c1)
-        all_c   = np.vstack([c0, c1]).astype(np.float32)
-        sc      = _scale(all_c, cfg.z_anisotropy)
-        ff      = np.array([0]*N0 + [1]*N1, dtype=np.float32)
-        pos     = np.column_stack([sc, ff]).astype(np.float32)
-        patches = np.concatenate([p0, p1], axis=0)
+        N0_real, N1 = len(c0), len(c1)
 
+        # ---- Inject phantom nodes into frame-t source ----
+        ph_list = list(phantom_pool.items())   # [(tid, ph_data), ...]
+        P       = len(ph_list)
+        ph_tids = [tid for tid, _ in ph_list]
+
+        if P > 0:
+            ph_proj = np.array([ph['pos'] + ph['vel']
+                                for _, ph in ph_list], dtype=np.float32)
+            c0_aug  = np.vstack([c0, ph_proj])
+            p0_aug  = np.zeros((N0_real + P, *p0.shape[1:]), dtype=p0.dtype)
+            p0_aug[:N0_real] = p0
+            # ids: phantoms get 0 (no GT id; labels not used at inference)
+            ids0_aug = np.zeros(N0_real + P, dtype=ids0.dtype)
+            ids0_aug[:N0_real] = ids0
+        else:
+            c0_aug, p0_aug, ids0_aug = c0, p0, ids0
+
+        N0 = len(c0_aug)
+
+        # ---- Build graph ----
         edge_index, edge_feat, _, _ = _build_graph(
-            c0, ids0, c1, ids1, t, parents_gt, p2c_gt,
+            c0_aug, ids0_aug, c1, ids1, t, parents_gt, p2c_gt,
             cfg.r_intra, cfg.r_cross, cfg.z_anisotropy,
         )
         if edge_index.shape[1] == 0:
             det_track.pop(t, None)
             continue
 
-        conn_logits, sister_logits, fg_logits = model(
-            torch.from_numpy(patches).to(device),
+        all_c = np.vstack([c0_aug, c1]).astype(np.float32)
+        sc    = _scale(all_c, cfg.z_anisotropy)
+        ff    = np.array([0]*N0 + [1]*N1, dtype=np.float32)
+        pos   = np.column_stack([sc, ff]).astype(np.float32)
+        patches_all = np.concatenate([p0_aug, p1], axis=0)
+
+        # ---- Encode → override phantom rows → GNN + classify ----
+        h_cnn = model.encode(
+            torch.from_numpy(patches_all).to(device),
             torch.from_numpy(pos).to(device),
+        )
+        for ph_i, (_, ph) in enumerate(ph_list):
+            h_cnn[N0_real + ph_i] = ph['h_feat'].to(device)
+
+        conn_logits, sister_logits, fg_logits = model.forward_from_features(
+            h_cnn,
             torch.from_numpy(edge_index).to(device),
             torch.from_numpy(edge_feat).to(device),
         )
@@ -266,10 +373,13 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
         sister_scores = torch.sigmoid(sister_logits).cpu().numpy()
         fg_scores     = torch.sigmoid(fg_logits).cpu().numpy()
 
-        # Mark predicted-BG nodes with frame flag -1 so intra_cluster ignores them.
+        # FG filter: real nodes use threshold; phantom nodes always pass
         ff_int = ff.astype(np.int32).copy()
         ff_int[fg_scores < cfg.fg_threshold] = -1
+        for ph_i in range(P):
+            ff_int[N0_real + ph_i] = 0
 
+        # ---- Clustering ----
         cl0_g = intra_cluster(all_c, conn_scores, edge_index, ff_int, 0, cfg.intra_threshold)
         cl1_g = intra_cluster(all_c, conn_scores, edge_index, ff_int, 1, cfg.intra_threshold)
 
@@ -279,34 +389,51 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
 
         cl0_loc = _cluster_local(cl0_g, 0)
         cl1_loc = _cluster_local(cl1_g, N0)
+        reps0   = cluster_representative(cl0_g, all_c)
+        reps1   = cluster_representative(cl1_g, all_c)
 
-        reps0 = cluster_representative(cl0_g, all_c)
-        reps1 = cluster_representative(cl1_g, all_c)
+        # Global node index → phantom track ID (for phantom-containing clusters)
+        ph_node_to_tid = {N0_real + i: ph_tids[i] for i in range(P)}
 
-        # --- Track IDs for frame-t clusters ---
+        # ---- Track IDs for frame-t clusters ----
         prev_track = det_track.get(t)
-        new_track0 = np.zeros(N0, dtype=np.int32)
+        new_track0 = np.zeros(N0_real, dtype=np.int32)
         cl0_tid    = []
         used_tids  = set()
 
-        for k0, cl in enumerate(cl0_loc):
-            tid = _cluster_tid(cl, prev_track) if prev_track is not None else 0
+        for k0, cl_loc in enumerate(cl0_loc):
+            # Phantom in this cluster overrides the track ID lookup
+            ph_tid = next(
+                (ph_node_to_tid[g] for g in cl_loc if g in ph_node_to_tid), 0
+            )
+            if ph_tid > 0:
+                tid = ph_tid
+            elif prev_track is not None:
+                tid = _cluster_tid(cl_loc, prev_track)
+            else:
+                tid = 0
+
             if tid == 0 or tid in used_tids:
                 tid = next_tid; next_tid += 1
                 track_meta[tid] = {'first': t, 'last': t, 'parent': 0}
                 frame_clusters[t].append((tid, reps0[k0]))
             used_tids.add(tid)
             cl0_tid.append(tid)
-            for i in cl:
-                new_track0[i] = tid
+            for i in cl_loc:
+                if i < N0_real:
+                    new_track0[i] = tid
 
         det_track[t] = new_track0
 
-        # --- Affinity matrices ---
+        # Cache mean h_cnn per frame-t cluster (needed to create phantoms below)
+        cl0_h = {k0: h_cnn[list(cl)].mean(0).detach().cpu()
+                 for k0, cl in enumerate(cl0_g)}
+
+        # ---- Affinity matrices ----
         aff        = cross_frame_scores(cl0_g, cl1_g, conn_scores, edge_index)
         sister_mat = sister_cluster_scores(cl1_g, sister_scores, edge_index, N0)
 
-        # --- Match with sister-based division detection ---
+        # ---- Match ----
         assignments = match_cross_frame_simple(
             aff, sister_mat, cl0_g, cl1_g, reps0, reps1,
             cfg.cross_threshold, mitosis_threshold,
@@ -314,7 +441,56 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
             cfg.r_cross, cfg.z_anisotropy,
         )
 
-        # --- Assign track IDs to frame-(t+1) clusters ---
+        assigned_k0 = {k0 for k0, _ in assignments}
+
+        # ---- Update phantom pool ----
+
+        # Phantoms whose cluster matched → track resumed, remove from pool
+        for k0, _ in assignments:
+            for node in cl0_g[k0]:
+                if node in ph_node_to_tid:
+                    phantom_pool.pop(ph_node_to_tid[node], None)
+
+        # Phantoms that appeared in no cluster (filtered as BG or out of range)
+        # → decrement directly; they'll be cleaned up below
+        ph_in_cluster = {ph_node_to_tid[n]
+                         for cl in cl0_g for n in cl if n in ph_node_to_tid}
+        for tid in list(phantom_pool):
+            if tid not in ph_in_cluster and tid in [t2 for t2, _ in ph_list]:
+                phantom_pool[tid]['frames_remaining'] -= 1
+
+        # Unmatched clusters → create or update phantoms
+        for k0 in range(len(cl0_g)):
+            if k0 in assigned_k0:
+                continue
+            tid      = cl0_tid[k0]
+            pos_now  = reps0[k0].copy()
+
+            if tid in phantom_pool:
+                # Existing phantom still unmatched → update position, decrement
+                old_pos = phantom_pool[tid]['pos'].copy()
+                phantom_pool[tid]['pos']              = pos_now
+                phantom_pool[tid]['vel']              = pos_now - old_pos
+                phantom_pool[tid]['frames_remaining'] -= 1
+            else:
+                # Real cluster ending → create new phantom
+                vel = pos_now - prev_track_reps.get(tid, pos_now)
+                phantom_pool[tid] = {
+                    'pos': pos_now,
+                    'h_feat': cl0_h[k0],
+                    'vel': vel,
+                    'frames_remaining': cfg.phantom_max_frames,
+                }
+
+        # Expire dead phantoms
+        for tid in [tid for tid, ph in phantom_pool.items()
+                    if ph['frames_remaining'] <= 0]:
+            del phantom_pool[tid]
+
+        # Update velocity reference positions for next frame
+        prev_track_reps = {cl0_tid[k0]: reps0[k0] for k0 in range(len(cl0_g))}
+
+        # ---- Assign track IDs to frame-(t+1) clusters ----
         new_track1 = np.zeros(N1, dtype=np.int32)
         matched_k1 = set()
 
@@ -351,8 +527,10 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
         if t % 20 == 0:
             n_mit = sum(1 for _, k1s in assignments if len(k1s) == 2)
             print(f'  pair {t:3d}/{n_frames-1}: '
-                  f'det={N0:3d}/{N1:3d}  cl={len(cl0_g):3d}/{len(cl1_g):3d}  '
-                  f'matched={len(assignments):3d}  mitoses={n_mit}')
+                  f'det={N0_real:3d}+{P}ph/{N1:3d}  '
+                  f'cl={len(cl0_g):3d}/{len(cl1_g):3d}  '
+                  f'matched={len(assignments):3d}  mitoses={n_mit}  '
+                  f'pool={len(phantom_pool)}')
 
     # -----------------------------------------------------------------------
     # Minimum track length filter

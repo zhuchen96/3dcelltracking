@@ -139,12 +139,14 @@ class TrackingDataset(Dataset):
     }
 
     def __init__(self, exp_ids, data_root, cache_dir,
-                 r_intra=20., r_cross=30., z_anisotropy=0.5):
+                 r_intra=20., r_cross=30., z_anisotropy=0.5,
+                 aug_drop_prob=0.0):
         self.cache_dir     = cache_dir
         self.data_root     = data_root
         self.r_intra       = r_intra
         self.r_cross       = r_cross
         self.z_anisotropy  = z_anisotropy
+        self.aug_drop_prob = aug_drop_prob
 
         self.samples = []    # (exp_id, t)
         self.mitosis = {}    # exp_id -> (parents, children, p2c)
@@ -289,6 +291,32 @@ class TrackingDataset(Dataset):
                         daughter_weights[N0 + i] = 3.0
             except FileNotFoundError:
                 pass
+
+        # --- Detection dropout augmentation ---
+        # Randomly drop FG nodes to simulate missed detections.  A dropped node
+        # has its edges masked invalid so the GNN trains without it, mirroring
+        # the phantom-node scenario at inference where a cell was missing for
+        # one frame and its neighbors must still form correct connections.
+        if self.aug_drop_prob > 0.0:
+            # Never drop dividing parents or their daughters — sister edges
+            # have only ~2 positive pairs per sample so losing one node
+            # destroys the signal entirely.
+            protected = np.zeros(N0 + N1, dtype=bool)
+            for i, cid in enumerate(ids0):
+                if int(cid) in dividing_ids:
+                    protected[i] = True
+            for i, cid in enumerate(ids1):
+                if int(cid) in daughter_ids:
+                    protected[N0 + i] = True
+            drop = (all_ids > 0) & (~protected) & (np.random.rand(N0 + N1) < self.aug_drop_prob)
+            if drop.any():
+                src_e, dst_e = edge_index[0], edge_index[1]
+                drop_edge = drop[src_e] | drop[dst_e]
+                valid[drop_edge]        = False
+                valid_sister[drop_edge] = False
+                fg_labels[drop]         = 0.0  # supervise as BG
+                valid_mitosis[drop]     = False
+                valid_daughter[drop]    = False
 
         return dict(
             patches          = torch.from_numpy(all_patches),

@@ -78,17 +78,19 @@ def eval_edges(model, dataset, device, cfg):
                 sister_p=sp, sister_r=sr, sister_f1=sf1)
 
 
-def train(cfg: Config):
+def train(cfg: Config, run_name: str = 'default'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
     train_ds = TrackingDataset(
         cfg.train_exps, cfg.data_root, cfg.cache_dir,
         cfg.r_intra, cfg.r_cross, cfg.z_anisotropy,
+        aug_drop_prob=cfg.aug_drop_prob,
     )
     val_ds = TrackingDataset(
         cfg.val_exps, cfg.data_root, cfg.cache_dir,
         cfg.r_intra, cfg.r_cross, cfg.z_anisotropy,
+        aug_drop_prob=0.0,
     )
     print(f'Train pairs: {len(train_ds)},  Val pairs: {len(val_ds)}')
 
@@ -106,7 +108,7 @@ def train(cfg: Config):
                                weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg.epochs)
 
-    ckpt_dir = os.path.join(cfg.cache_dir, 'checkpoints_simple')
+    ckpt_dir = os.path.join(cfg.cache_dir, 'checkpoints_simple', run_name)
     os.makedirs(ckpt_dir, exist_ok=True)
     log_path = os.path.join(ckpt_dir, 'log.jsonl')
 
@@ -179,5 +181,10 @@ def train(cfg: Config):
 
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--run-name', default='default',
+                        help='subdirectory under checkpoints_simple/ for this run')
+    args = parser.parse_args()
     cfg = Config()
-    train(cfg)
+    train(cfg, run_name=args.run_name)
