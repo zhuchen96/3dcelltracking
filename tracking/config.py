@@ -19,6 +19,7 @@ class Config:
     # Model
     feat_dim: int = 128
     gnn_layers: int = 2
+    in_channels: int = 1   # 1 = raw only (baseline), 2 = raw + exp(-det/5)
 
     # Training
     lr: float = 3e-4
@@ -34,13 +35,13 @@ class Config:
     daughter_pos_weight: float = 20.0   # same rarity as mother — ~2 per frame pair
     fg_loss_weight: float = 1.0         # weight of foreground head loss
     fg_pos_weight: float = 3.0          # FG:BG ratio ~1:2.3
-    sister_loss_weight: float = 5.0     # weight of sister-edge loss (SimpleTrackingNet)
+    sister_loss_weight: float = 10.0    # weight of sister-edge loss (SimpleTrackingNet)
     sister_pos_weight: float = 100.0    # ~2 sister pairs per ~500 intra-t+1 edges → 1:250
 
     # Inference thresholds
     intra_threshold: float = 0.5          # merge same-frame detections of the same cell
-    cross_threshold: float = 0.5          # cross-frame link threshold
-    mitosis_threshold: float = 0.6        # affinity threshold for second daughter candidate
+    cross_threshold: float = 0.4          # cross-frame link threshold
+    mitosis_threshold: float = 0.4        # affinity threshold for second daughter candidate
     mitosis_head_threshold: float = 0.9   # sigmoid threshold for mitosis head (mother)
     daughter_head_threshold: float = 0.3  # sigmoid threshold for daughter head (hard gate)
     fg_threshold: float = 0.5             # sigmoid threshold for foreground head at inference
@@ -48,9 +49,13 @@ class Config:
     min_track_length: int = 5             # drop tracks shorter than this (frames); keeps daughters regardless
     phantom_max_frames: int = 2           # max frames a phantom node persists before the track ends
 
-    # Training augmentation
-    aug_drop_prob: float = 0.0            # probability of dropping an FG node during training (0 = off)
+    # Metric learning
+    metric_loss_weight: float = 0.0       # weight of cosine embedding loss on h_cnn cross-frame pairs
 
-    # Data splits
-    train_exps: Tuple[str, ...] = ('0501', '0507')
-    val_exps: Tuple[str, ...] = ('0515',)
+    # Training augmentation / schedule
+    warmup_epochs: int   = 5             # linear LR warmup epochs (0 = no warmup, pure cosine)
+    aug_drop_prob: float = 0.05          # probability of dropping an FG node during training
+
+    # Data splits  (0004=test, 0003=val, all others=train)
+    train_exps: Tuple[str, ...] = ('0001', '0002', '0501', '0507', '0515', '0517', '0522', '0528', '0605')
+    val_exps: Tuple[str, ...] = ('0003',)

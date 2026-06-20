@@ -16,6 +16,30 @@ from scipy import ndimage
 
 
 EXPERIMENT_DIRS = {
+    '0001': dict(
+        det='detections/0001',
+        mask='masks/sequence1_final_compressed',
+        raw='raw_imgs/0001',
+        mitosis='mitotic_events/mitosis_info_0001.json',
+    ),
+    '0002': dict(
+        det='detections/0002',
+        mask='masks/sequence2_final_compressed',
+        raw='raw_imgs/0002',
+        mitosis='mitotic_events/mitosis_info_0002.json',
+    ),
+    '0003': dict(
+        det='detections/0003',
+        mask='masks/sequence3_final_compressed',
+        raw='raw_imgs/0003',
+        mitosis='mitotic_events/mitosis_info_0003.json',
+    ),
+    '0004': dict(
+        det='detections/0004',
+        mask='masks/sequence4_final_compressed',
+        raw='raw_imgs/0004',
+        mitosis='mitotic_events/mitosis_info_0004.json',
+    ),
     '0501': dict(
         det='detections/0501',
         mask='masks/20250501_click_final',
@@ -33,6 +57,30 @@ EXPERIMENT_DIRS = {
         mask='masks/20250515_click_final',
         raw='raw_imgs/0515',
         mitosis='mitotic_events/mitosis_info_0515.json',
+    ),
+    '0517': dict(
+        det='detections/0517',
+        mask='masks/20250517_final',
+        raw='raw_imgs/0517',
+        mitosis='mitotic_events/mitosis_info_0517.json',
+    ),
+    '0522': dict(
+        det='detections/0522',
+        mask='masks/20250522_final',
+        raw='raw_imgs/0522',
+        mitosis='mitotic_events/mitosis_info_0522.json',
+    ),
+    '0528': dict(
+        det='detections/0528',
+        mask='masks/20250528_final',
+        raw='raw_imgs/0528',
+        mitosis='mitotic_events/mitosis_info_0528.json',
+    ),
+    '0605': dict(
+        det='detections/0605',
+        mask='masks/20250605_final',
+        raw='raw_imgs/0605',
+        mitosis='mitotic_events/mitosis_info_0605.json',
     ),
 }
 
@@ -98,11 +146,11 @@ def assign_labels(centers, mask, radius=2):
     return labels
 
 
-def extract_patch(raw, center, patch_size):
-    """Normalised float32 patch (1, pz, py, px) centered at ZYX center."""
+def extract_patch(vol, center, patch_size):
+    """Z-score normalised float32 crop (pz, py, px) centered at ZYX center."""
     pz, py, px = patch_size
     z, y, x = center.astype(int)
-    Z, Y, X = raw.shape
+    Z, Y, X = vol.shape
 
     z0, z1 = z - pz // 2, z + pz // 2
     y0, y1 = y - py // 2, y + py // 2
@@ -112,12 +160,32 @@ def extract_patch(raw, center, patch_size):
           (max(0, -y0), max(0, y1 - Y)),
           (max(0, -x0), max(0, x1 - X))]
 
-    crop = raw[max(0,z0):min(Z,z1), max(0,y0):min(Y,y1), max(0,x0):min(X,x1)].astype(np.float32)
+    crop = vol[max(0,z0):min(Z,z1), max(0,y0):min(Y,y1), max(0,x0):min(X,x1)].astype(np.float32)
     if any(p[0] + p[1] > 0 for p in pd):
         crop = np.pad(crop, pd, mode='reflect')
 
     mu, sigma = crop.mean(), crop.std()
-    return ((crop - mu) / (sigma + 1e-6))[np.newaxis]  # (1, pz, py, px)
+    return (crop - mu) / (sigma + 1e-6)   # (pz, py, px)
+
+
+def extract_patch_nonorm(vol, center, patch_size):
+    """Float32 crop (pz, py, px) with no normalisation (for pre-scaled channels)."""
+    pz, py, px = patch_size
+    z, y, x = center.astype(int)
+    Z, Y, X = vol.shape
+
+    z0, z1 = z - pz // 2, z + pz // 2
+    y0, y1 = y - py // 2, y + py // 2
+    x0, x1 = x - px // 2, x + px // 2
+
+    pd = [(max(0, -z0), max(0, z1 - Z)),
+          (max(0, -y0), max(0, y1 - Y)),
+          (max(0, -x0), max(0, x1 - X))]
+
+    crop = vol[max(0,z0):min(Z,z1), max(0,y0):min(Y,y1), max(0,x0):min(X,x1)].astype(np.float32)
+    if any(p[0] + p[1] > 0 for p in pd):
+        crop = np.pad(crop, pd, mode='constant', constant_values=0.0)
+    return crop   # (pz, py, px)
 
 
 def preprocess_experiment(exp_id, data_root, cache_dir, patch_size=(16, 24, 24)):
@@ -132,7 +200,9 @@ def preprocess_experiment(exp_id, data_root, cache_dir, patch_size=(16, 24, 24))
     det_files  = sorted_tifs(det_dir)
     mask_files = sorted_tifs(mask_dir)
     raw_files  = sorted_tifs(raw_dir)
-    n_frames   = len(det_files)
+    # Clip to frames where all three modalities are available.
+    # 0002: raw has 50 extra frames beyond det/mask; 0003: mask stops 91 frames early.
+    n_frames   = min(len(det_files), len(mask_files))
 
     print(f'[{exp_id}] {n_frames} frames')
 
@@ -148,7 +218,7 @@ def preprocess_experiment(exp_id, data_root, cache_dir, patch_size=(16, 24, 24))
             np.savez_compressed(out_path,
                                 centers=np.zeros((0, 3), dtype=np.float32),
                                 cell_ids=np.zeros(0, dtype=np.int32),
-                                patches=np.zeros((0, 1, *patch_size), dtype=np.float32))
+                                patches=np.zeros((0, 2, *patch_size), dtype=np.float32))
             continue
 
         det     = tifffile.imread(det_files[t])
@@ -158,12 +228,21 @@ def preprocess_experiment(exp_id, data_root, cache_dir, patch_size=(16, 24, 24))
             np.savez_compressed(out_path,
                                 centers=np.zeros((0, 3), dtype=np.float32),
                                 cell_ids=np.zeros(0, dtype=np.int32),
-                                patches=np.zeros((0, 1, *patch_size), dtype=np.float32))
+                                patches=np.zeros((0, 2, *patch_size), dtype=np.float32))
             continue
 
         raw      = tifffile.imread(raw_files[t])
         cell_ids = assign_labels(centers, mask)
-        patches  = np.stack([extract_patch(raw, c, patch_size) for c in centers])
+        # 2-channel patches:
+        #   ch0 = raw intensity (z-score normalised per patch)
+        #   ch1 = exp(-det/5): cell body→1.0, decays outward; no per-patch norm so
+        #         cell size is preserved across patches (fixes z-score shape erasure)
+        det_prob = np.exp(-det.astype(np.float32) / 5.0)
+        patches = np.stack([
+            np.stack([extract_patch(raw, c, patch_size),
+                      extract_patch_nonorm(det_prob, c, patch_size)], axis=0)
+            for c in centers
+        ])
 
         np.savez_compressed(out_path, centers=centers, cell_ids=cell_ids, patches=patches)
 
@@ -182,6 +261,6 @@ if __name__ == '__main__':
     cfg = Config()
     os.makedirs(cfg.cache_dir, exist_ok=True)
 
-    exps = sys.argv[1:] if len(sys.argv) > 1 else ['0501', '0507', '0515']
+    exps = sys.argv[1:] if len(sys.argv) > 1 else list(EXPERIMENT_DIRS.keys())
     for exp in exps:
         preprocess_experiment(exp, cfg.data_root, cfg.cache_dir, cfg.patch_size)

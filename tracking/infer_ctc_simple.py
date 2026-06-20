@@ -268,7 +268,7 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
     print(f'Device: {device}')
 
     model = SimpleTrackingNet(
-        feat_dim=cfg.feat_dim, gnn_layers=cfg.gnn_layers
+        feat_dim=cfg.feat_dim, gnn_layers=cfg.gnn_layers, in_channels=cfg.in_channels
     ).to(device)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
@@ -358,7 +358,7 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
 
         # ---- Encode → override phantom rows → GNN + classify ----
         h_cnn = model.encode(
-            torch.from_numpy(patches_all).to(device),
+            torch.from_numpy(patches_all[:, :cfg.in_channels]).to(device),
             torch.from_numpy(pos).to(device),
         )
         for ph_i, (_, ph) in enumerate(ph_list):

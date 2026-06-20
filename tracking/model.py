@@ -35,12 +35,13 @@ class ResBlock3D(nn.Module):
 
 
 class Encoder3D(nn.Module):
-    """Input: (B, 1, pz, py, px)  →  Output: (B, feat_dim)"""
+    """Input: (B, in_channels, pz, py, px)  →  Output: (B, feat_dim)
+    Channel 0: raw intensity.  Channel 1 (optional): exp(-det/5) detection probability."""
 
-    def __init__(self, feat_dim=128):
+    def __init__(self, feat_dim=128, in_channels=1):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv3d(1, 32, 3, padding=1, bias=False),
+            nn.Conv3d(in_channels, 32, 3, padding=1, bias=False),
             nn.BatchNorm3d(32), nn.ReLU(inplace=True),
         )
         self.layer1 = nn.Sequential(ResBlock3D(32), nn.MaxPool3d(2))   # /2
@@ -171,9 +172,9 @@ class SimpleTrackingNet(nn.Module):
     be injected: call encode() → override phantom rows in h_cnn → forward_from_features().
     """
 
-    def __init__(self, feat_dim=128, gnn_layers=2, edge_dim=4, pos_dim=4):
+    def __init__(self, feat_dim=128, gnn_layers=2, edge_dim=4, pos_dim=4, in_channels=1):
         super().__init__()
-        self.encoder     = Encoder3D(feat_dim)
+        self.encoder     = Encoder3D(feat_dim, in_channels=in_channels)
         self.pos_enc     = nn.Linear(pos_dim, feat_dim)
         self.fg_head     = ForegroundHead(feat_dim)
         self.gnn         = nn.ModuleList(

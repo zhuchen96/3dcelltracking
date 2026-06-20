@@ -133,9 +133,17 @@ class TrackingDataset(Dataset):
     """
 
     MITOSIS_PATHS = {
+        '0001': 'mitotic_events/mitosis_info_0001.json',
+        '0002': 'mitotic_events/mitosis_info_0002.json',
+        '0003': 'mitotic_events/mitosis_info_0003.json',
+        '0004': 'mitotic_events/mitosis_info_0004.json',
         '0501': 'mitotic_events/mitosis_info_0501.json',
         '0507': 'mitotic_events/mitosis_info_0507.json',
         '0515': 'mitotic_events/mitosis_info_0515.json',
+        '0517': 'mitotic_events/mitosis_info_0517.json',
+        '0522': 'mitotic_events/mitosis_info_0522.json',
+        '0528': 'mitotic_events/mitosis_info_0528.json',
+        '0605': 'mitotic_events/mitosis_info_0605.json',
     }
 
     def __init__(self, exp_ids, data_root, cache_dir,

@@ -11,14 +11,33 @@ Usage:
 
 import os
 import json
+import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from tracking.config import Config
 from tracking.dataset import TrackingDataset, collate_fn
 from tracking.model import SimpleTrackingNet
+
+
+def cosine_metric_loss(h_cnn, edge_index, edge_feat, labels, valid, margin=0.3):
+    """
+    Cosine embedding loss on cross-frame edges only.
+    Same-cell pairs (label=1): push cosine sim → 1.
+    Different-cell pairs (label=0): push cosine sim < margin.
+    Applied to pre-GNN h_cnn so the CNN encoder learns discriminative identity features.
+    """
+    is_cross = edge_feat[:, 3] < 0.5          # same_frame flag == 0
+    mask = valid & is_cross
+    if mask.sum() == 0:
+        return h_cnn.sum() * 0.0
+    src, dst = edge_index[0][mask], edge_index[1][mask]
+    h_norm = F.normalize(h_cnn, dim=-1)
+    target = 2 * labels[mask] - 1             # label 1→+1, label 0→-1
+    return F.cosine_embedding_loss(h_norm[src], h_norm[dst], target, margin=margin)
 
 
 def focal_bce(logits, labels, valid, pos_weight, gamma=2.0):
@@ -51,7 +70,7 @@ def eval_edges(model, dataset, device, cfg):
         if edge_index.shape[1] == 0:
             continue
 
-        conn_logits, sister_logits, fg_logits = model(patches, positions, edge_index, edge_feat)
+        conn_logits, sister_logits, fg_logits = model(patches[:, :cfg.in_channels], positions, edge_index, edge_feat)
 
         valid = item['valid'].to(device)
         if valid.sum() > 0:
@@ -100,19 +119,29 @@ def train(cfg: Config, run_name: str = 'default'):
     model = SimpleTrackingNet(
         feat_dim=cfg.feat_dim,
         gnn_layers=cfg.gnn_layers,
+        in_channels=cfg.in_channels,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Parameters: {n_params:,}')
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg.epochs)
+    warmup_epochs = cfg.warmup_epochs
+    if warmup_epochs > 0:
+        def _lr_lambda(ep):   # ep is 0-indexed
+            if ep < warmup_epochs:
+                return (ep + 1) / warmup_epochs
+            progress = (ep - warmup_epochs) / max(cfg.epochs - warmup_epochs, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        sched = torch.optim.lr_scheduler.LambdaLR(optim, _lr_lambda)
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg.epochs)
 
     ckpt_dir = os.path.join(cfg.cache_dir, 'checkpoints_simple', run_name)
     os.makedirs(ckpt_dir, exist_ok=True)
     log_path = os.path.join(ckpt_dir, 'log.jsonl')
 
-    best_f1 = 0.0
+    best_combined = 0.0
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -127,15 +156,14 @@ def train(cfg: Config, run_name: str = 'default'):
                 if edge_index.shape[1] == 0:
                     continue
 
-                conn_logits, sister_logits, fg_logits = model(
-                    patches, positions, edge_index, edge_feat)
+                labels_d    = item['labels'].to(device)
+                valid_d     = item['valid'].to(device)
 
-                conn_loss = focal_bce(
-                    conn_logits,
-                    item['labels'].to(device),
-                    item['valid'].to(device),
-                    cfg.pos_weight,
-                )
+                h_cnn = model.encode(patches[:, :cfg.in_channels], positions)
+                conn_logits, sister_logits, fg_logits = model.forward_from_features(
+                    h_cnn, edge_index, edge_feat)
+
+                conn_loss = focal_bce(conn_logits, labels_d, valid_d, cfg.pos_weight)
                 sister_loss = focal_bce(
                     sister_logits,
                     item['sister_labels'].to(device),
@@ -148,9 +176,11 @@ def train(cfg: Config, run_name: str = 'default'):
                     item['valid_fg'].to(device),
                     cfg.fg_pos_weight,
                 )
+                m_loss = cosine_metric_loss(h_cnn, edge_index, edge_feat, labels_d, valid_d)
                 loss = (conn_loss
                         + cfg.sister_loss_weight * sister_loss
-                        + cfg.fg_loss_weight * fg_loss)
+                        + cfg.fg_loss_weight * fg_loss
+                        + cfg.metric_loss_weight * m_loss)
                 if loss.requires_grad:
                     optim.zero_grad()
                     loss.backward()
@@ -163,28 +193,44 @@ def train(cfg: Config, run_name: str = 'default'):
 
         if epoch % 5 == 0 or epoch == 1:
             metrics = eval_edges(model, val_ds, device, cfg)
-            f1 = metrics['f1']
+            combined = metrics['f1'] + metrics['sister_f1']
             print(f'Epoch {epoch:4d} | loss {avg_loss:.4f} | '
-                  f'conn F1={f1:.3f} | '
+                  f'conn F1={metrics["f1"]:.3f} | '
                   f'sister F1={metrics["sister_f1"]:.3f} '
-                  f'(P={metrics["sister_p"]:.3f} R={metrics["sister_r"]:.3f})')
+                  f'(P={metrics["sister_p"]:.3f} R={metrics["sister_r"]:.3f}) | '
+                  f'combined={combined:.3f}')
             with open(log_path, 'a') as fh:
                 fh.write(json.dumps(dict(epoch=epoch, loss=avg_loss, **metrics)) + '\n')
-            if f1 > best_f1:
-                best_f1 = f1
+            if combined > best_combined:
+                best_combined = combined
                 torch.save(model.state_dict(), os.path.join(ckpt_dir, 'best.pt'))
         else:
             print(f'Epoch {epoch:4d} | loss {avg_loss:.4f}')
 
-    print(f'\nBest val F1: {best_f1:.4f}')
+    print(f'\nBest combined (conn+sister) F1: {best_combined:.4f}')
     torch.save(model.state_dict(), os.path.join(ckpt_dir, 'last.pt'))
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--run-name', default='default',
-                        help='subdirectory under checkpoints_simple/ for this run')
+    parser.add_argument('--run-name', default='default')
+    parser.add_argument('--aug-drop-prob',      type=float, default=None,
+                        help='override cfg.aug_drop_prob')
+    parser.add_argument('--sister-loss-weight', type=float, default=None,
+                        help='override cfg.sister_loss_weight')
+    parser.add_argument('--warmup-epochs',      type=int,   default=None,
+                        help='override cfg.warmup_epochs (0 = no warmup)')
+    parser.add_argument('--in-channels',        type=int,   default=None,
+                        help='override cfg.in_channels (1 or 2)')
     args = parser.parse_args()
+
     cfg = Config()
+    if args.aug_drop_prob      is not None: cfg.aug_drop_prob      = args.aug_drop_prob
+    if args.sister_loss_weight is not None: cfg.sister_loss_weight = args.sister_loss_weight
+    if args.warmup_epochs      is not None: cfg.warmup_epochs      = args.warmup_epochs
+    if args.in_channels        is not None: cfg.in_channels        = args.in_channels
+
+    print(f'aug_drop_prob={cfg.aug_drop_prob}  sister_loss_weight={cfg.sister_loss_weight}  '
+          f'warmup_epochs={cfg.warmup_epochs}  in_channels={cfg.in_channels}')
     train(cfg, run_name=args.run_name)
