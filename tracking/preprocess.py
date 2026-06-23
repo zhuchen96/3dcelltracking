@@ -218,7 +218,7 @@ def preprocess_experiment(exp_id, data_root, cache_dir, patch_size=(16, 24, 24))
             np.savez_compressed(out_path,
                                 centers=np.zeros((0, 3), dtype=np.float32),
                                 cell_ids=np.zeros(0, dtype=np.int32),
-                                patches=np.zeros((0, 2, *patch_size), dtype=np.float32))
+                                patches=np.zeros((0, 1, *patch_size), dtype=np.float32))
             continue
 
         det     = tifffile.imread(det_files[t])
@@ -228,19 +228,16 @@ def preprocess_experiment(exp_id, data_root, cache_dir, patch_size=(16, 24, 24))
             np.savez_compressed(out_path,
                                 centers=np.zeros((0, 3), dtype=np.float32),
                                 cell_ids=np.zeros(0, dtype=np.int32),
-                                patches=np.zeros((0, 2, *patch_size), dtype=np.float32))
+                                patches=np.zeros((0, 1, *patch_size), dtype=np.float32))
             continue
 
         raw      = tifffile.imread(raw_files[t])
         cell_ids = assign_labels(centers, mask)
-        # 2-channel patches:
-        #   ch0 = raw intensity (z-score normalised per patch)
-        #   ch1 = exp(-det/5): cell body→1.0, decays outward; no per-patch norm so
-        #         cell size is preserved across patches (fixes z-score shape erasure)
-        det_prob = np.exp(-det.astype(np.float32) / 5.0)
+        # 1-channel patches: raw intensity z-score normalised per patch.
+        # Larger patch (16×40×40) captures immediate cell neighbourhood for
+        # richer CNN features without duplicating the GNN's relational context.
         patches = np.stack([
-            np.stack([extract_patch(raw, c, patch_size),
-                      extract_patch_nonorm(det_prob, c, patch_size)], axis=0)
+            extract_patch(raw, c, patch_size)[np.newaxis]
             for c in centers
         ])
 

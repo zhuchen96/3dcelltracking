@@ -1,18 +1,13 @@
 """
 Inference → Cell Tracking Challenge (CTC) output using SimpleTrackingNet.
 
-Division detection uses sister scores (two daughters look similar to each other)
-instead of the separate mitosis head used in TrackingNet.  No FG head gating —
-score-gated message passing in the GNN suppresses background detections.
+At each step t the model sees a TRIPLET (t-1, t, t+1):
+  - prev (t-1): context nodes that improve GNN features for frame-t nodes
+  - curr (t):   source frame — get clustered and assigned track IDs
+  - next (t+1): destination frame — get clustered and matched to curr
 
-Division criterion for frame-t cluster k0:
-  1. Both conn_aff[k0, k1a] >= mitosis_threshold
-        conn_aff[k0, k1b] >= mitosis_threshold
-  2. sister_score[k1a, k1b] >= sister_threshold
-  → division (k0 → [k1a, k1b])
-
-Best sister pair per mother is chosen by aff[k0,k1a] + aff[k0,k1b] + sister_score.
-Assignments are greedy (highest-scoring division first).
+Division detection uses sister scores (two daughters of the same parent look
+similar to each other) on intra-next edges.
 
 Usage:
     python -m tracking.infer_ctc_simple --exp 0515 \\
@@ -31,8 +26,8 @@ import tifffile
 from scipy.optimize import linear_sum_assignment
 
 from tracking.config import Config
-from tracking.dataset import _build_graph, _scale
-from tracking.model import SimpleTrackingNet
+from tracking.dataset import _build_triplet_graph, _scale
+from tracking.model import SimpleTrackingNet, LegacySimpleTrackingNet
 from tracking.preprocess import EXPERIMENT_DIRS, sorted_tifs
 
 
@@ -56,8 +51,14 @@ class _UF:
             self.parent[rb] = ra
 
 
-def intra_cluster(centers, scores, edge_index, frame_flags, frame_id, threshold):
-    """Cluster detections within one frame using high-scoring intra-frame edges."""
+def intra_cluster(centers, scores, edge_index, frame_flags, frame_id, threshold,
+                  sister_scores=None, sister_suppress=0.0):
+    """Cluster detections within one frame using high-scoring intra-frame edges.
+
+    If sister_scores is provided, edges with sister_score >= sister_suppress are
+    never merged even when conn_score >= threshold.  This prevents newly divided
+    daughter pairs from collapsing into a single cluster.
+    """
     node_mask  = (frame_flags == frame_id)
     global_idx = np.where(node_mask)[0]
     n_local    = len(global_idx)
@@ -70,6 +71,8 @@ def intra_cluster(centers, scores, edge_index, frame_flags, frame_id, threshold)
         s, d = int(src[e]), int(dst[e])
         if frame_flags[s] != frame_id or frame_flags[d] != frame_id:
             continue
+        if sister_scores is not None and sister_scores[e] >= sister_suppress:
+            continue   # likely daughter pair — keep separate
         if scores[e] >= threshold:
             uf.union(g2l[s], g2l[d])
     clusters = {}
@@ -79,12 +82,12 @@ def intra_cluster(centers, scores, edge_index, frame_flags, frame_id, threshold)
 
 
 def cluster_representative(clusters, centers):
-    """Mean ZYX position for each cluster."""
+    """Mean ZYX position for each cluster (global node indices into centers)."""
     return np.array([centers[c].mean(0) for c in clusters])
 
 
 def cross_frame_scores(clusters0, clusters1, scores, edge_index):
-    """Mean edge probability between each pair of (frame-t, frame-t+1) clusters."""
+    """Mean edge probability between each pair of (curr, next) clusters."""
     K0, K1 = len(clusters0), len(clusters1)
     if K0 == 0 or K1 == 0:
         return np.zeros((K0, K1))
@@ -108,32 +111,24 @@ def cross_frame_scores(clusters0, clusters1, scores, edge_index):
     return aff
 
 
-# ---------------------------------------------------------------------------
-# Sister score matrix between frame-(t+1) cluster pairs
-# ---------------------------------------------------------------------------
-
-def sister_cluster_scores(clusters1, sister_scores, edge_index, N0):
+def sister_cluster_scores(clusters_next, sister_scores, edge_index, next_offset):
     """
-    Mean sister-head score for each pair of frame-(t+1) clusters.
+    Mean sister-head score for each pair of next-frame clusters.
 
-    Only intra-t+1 edges (both nodes >= N0) contribute.
-    Returns (K1, K1) symmetric float matrix.
+    next_offset = N_prev + N_curr (first global index of a next-frame node).
+    Only intra-next edges (both nodes >= next_offset) contribute.
+    Returns (K_next, K_next) symmetric float matrix.
     """
-    K1 = len(clusters1)
-    mat = np.zeros((K1, K1), dtype=np.float32)
-    cnt = np.zeros((K1, K1), dtype=np.float32)
-    if K1 == 0:
+    K = len(clusters_next)
+    mat = np.zeros((K, K), dtype=np.float32)
+    cnt = np.zeros((K, K), dtype=np.float32)
+    if K == 0:
         return mat
-
-    node2cl = {}
-    for k, cl in enumerate(clusters1):
-        for g in cl:
-            node2cl[g] = k
-
+    node2cl = {g: k for k, cl in enumerate(clusters_next) for g in cl}
     src, dst = edge_index[0], edge_index[1]
     for e in range(len(sister_scores)):
         s, d = int(src[e]), int(dst[e])
-        if s < N0 or d < N0:
+        if s < next_offset or d < next_offset:
             continue
         ka = node2cl.get(s, -1)
         kb = node2cl.get(d, -1)
@@ -141,7 +136,6 @@ def sister_cluster_scores(clusters1, sister_scores, edge_index, N0):
             continue
         mat[ka, kb] += sister_scores[e]
         cnt[ka, kb] += 1
-
     mask = cnt > 0
     mat[mask] /= cnt[mask]
     return mat
@@ -154,15 +148,7 @@ def sister_cluster_scores(clusters1, sister_scores, edge_index, N0):
 def match_cross_frame_simple(aff, sister_mat, clusters0, clusters1, reps0, reps1,
                               threshold, mitosis_threshold, sister_threshold,
                               r_cross, z_anisotropy):
-    """
-    1-to-1 (normal link) or 1-to-2 (division) assignment.
-
-    Division pre-pass runs before Hungarian to reserve daughters.
-    Division candidates scored by aff[k0,k1a] + aff[k0,k1b] + sister_mat[k1a,k1b].
-    Greedy assignment: highest-scoring candidate wins.
-
-    Returns list of (k0, [k1, ...]) tuples.
-    """
+    """1-to-1 (normal link) or 1-to-2 (division) assignment."""
     K0, K1 = len(clusters0), len(clusters1)
     if K0 == 0 or K1 == 0:
         return []
@@ -174,14 +160,11 @@ def match_cross_frame_simple(aff, sister_mat, clusters0, clusters1, reps0, reps1
     cost = 1.0 - aff.copy()
     cost[dist_matrix > r_cross] = 1.0
 
-    # --- Division pre-pass ---
+    # Division pre-pass
     div_candidates = []
     for k0 in range(K0):
-        eligible = [
-            k1 for k1 in range(K1)
-            if (aff[k0, k1] >= mitosis_threshold and
-                dist_matrix[k0, k1] <= r_cross)
-        ]
+        eligible = [k1 for k1 in range(K1)
+                    if aff[k0, k1] >= mitosis_threshold and dist_matrix[k0, k1] <= r_cross]
         if len(eligible) < 2:
             continue
         for i in range(len(eligible)):
@@ -193,33 +176,26 @@ def match_cross_frame_simple(aff, sister_mat, clusters0, clusters1, reps0, reps1
                     div_candidates.append((score, k0, k1a, k1b))
 
     div_candidates.sort(reverse=True)
-
-    reserved_k0 = set()
-    reserved_k1 = set()
+    reserved_k0 = set(); reserved_k1 = set()
     division_assignments = []
     for score, k0, k1a, k1b in div_candidates:
         if k0 in reserved_k0 or k1a in reserved_k1 or k1b in reserved_k1:
             continue
         division_assignments.append((k0, [k1a, k1b]))
-        reserved_k0.add(k0)
-        reserved_k1.add(k1a)
-        reserved_k1.add(k1b)
+        reserved_k0.add(k0); reserved_k1.add(k1a); reserved_k1.add(k1b)
 
-    # --- 1-to-1 Hungarian on remaining clusters ---
+    # 1-to-1 Hungarian on remaining
     rem_k0 = [k for k in range(K0) if k not in reserved_k0]
     rem_k1 = [k for k in range(K1) if k not in reserved_k1]
-
     assignments = list(division_assignments)
     if rem_k0 and rem_k1:
-        rk0 = np.array(rem_k0)
-        rk1 = np.array(rem_k1)
+        rk0 = np.array(rem_k0); rk1 = np.array(rem_k1)
         sub_cost = cost[np.ix_(rk0, rk1)]
         row_ind, col_ind = linear_sum_assignment(sub_cost)
         for r, c in zip(row_ind, col_ind):
             k0, k1 = int(rk0[r]), int(rk1[c])
             if aff[k0, k1] >= threshold:
                 assignments.append((k0, [k1]))
-
     return assignments
 
 
@@ -229,17 +205,13 @@ def match_cross_frame_simple(aff, sister_mat, clusters0, clusters1, reps0, reps1
 
 def _draw_ellipsoid(mask, center_zyx, radius_zyx, value):
     Z, Y, X = mask.shape
-    z0 = int(round(center_zyx[0]))
-    y0 = int(round(center_zyx[1]))
-    x0 = int(round(center_zyx[2]))
+    z0 = int(round(center_zyx[0])); y0 = int(round(center_zyx[1])); x0 = int(round(center_zyx[2]))
     rz, ry, rx = radius_zyx
-    z_lo = max(0, z0 - rz);  z_hi = min(Z, z0 + rz + 1)
-    y_lo = max(0, y0 - ry);  y_hi = min(Y, y0 + ry + 1)
-    x_lo = max(0, x0 - rx);  x_hi = min(X, x0 + rx + 1)
+    z_lo = max(0, z0 - rz); z_hi = min(Z, z0 + rz + 1)
+    y_lo = max(0, y0 - ry); y_hi = min(Y, y0 + ry + 1)
+    x_lo = max(0, x0 - rx); x_hi = min(X, x0 + rx + 1)
     zz, yy, xx = np.mgrid[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi]
-    inside = (((zz - z0) / rz) ** 2 +
-              ((yy - y0) / ry) ** 2 +
-              ((xx - x0) / rx) ** 2) <= 1.0
+    inside = (((zz - z0) / rz)**2 + ((yy - y0) / ry)**2 + ((xx - x0) / rx)**2) <= 1.0
     mask[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi][inside] = np.uint16(value)
 
 
@@ -248,7 +220,6 @@ def _cluster_local(clusters_global, offset):
 
 
 def _cluster_tid(cluster_local, det_track):
-    # Bounds-check guards against phantom node indices that exceed det_track size.
     tids = [int(det_track[i]) for i in cluster_local
             if i < len(det_track) and det_track[i] > 0]
     return Counter(tids).most_common(1)[0][0] if tids else 0
@@ -262,15 +233,21 @@ def _cluster_tid(cluster_local, det_track):
 def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
                               sister_threshold=0.5,
                               mitosis_threshold=None,
-                              radius_zyx=(3, 6, 6)):
+                              radius_zyx=(3, 6, 6),
+                              legacy=False):
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
-    model = SimpleTrackingNet(
-        feat_dim=cfg.feat_dim, gnn_layers=cfg.gnn_layers, in_channels=cfg.in_channels
-    ).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    if legacy:
+        model = LegacySimpleTrackingNet(
+            feat_dim=cfg.feat_dim, gnn_layers=cfg.gnn_layers, in_channels=cfg.in_channels
+        ).to(device)
+    else:
+        model = SimpleTrackingNet(
+            feat_dim=cfg.feat_dim, gnn_layers=cfg.gnn_layers, in_channels=cfg.in_channels
+        ).to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     model.eval()
     print(f'Loaded:           {ckpt_path}')
     if mitosis_threshold is None:
@@ -303,15 +280,14 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
     track_meta     = {}
     next_tid       = 1
 
-    # Phantom node state
-    # phantom_pool[tid] = {pos, h_feat, vel, frames_remaining}
+    # Phantom node state: tid -> {pos, h_feat_cnn, vel, frames_remaining}
     phantom_pool    = {}
     prev_track_reps = {}   # tid -> last known ZYX position (for velocity)
 
     for t in range(n_frames - 1):
+        # ---- Load frames ----
         d0 = np.load(os.path.join(cache_dir, f'frame_{t:04d}.npz'))
         d1 = np.load(os.path.join(cache_dir, f'frame_{t+1:04d}.npz'))
-
         c0, ids0, p0 = d0['centers'], d0['cell_ids'], d0['patches']
         c1, ids1, p1 = d1['centers'], d1['cell_ids'], d1['patches']
 
@@ -322,7 +298,17 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
 
         N0_real, N1 = len(c0), len(c1)
 
-        # ---- Inject phantom nodes into frame-t source ----
+        # ---- Load context frame (t-1) ----
+        if t > 0 and not legacy:
+            d_ctx = np.load(os.path.join(cache_dir, f'frame_{t-1:04d}.npz'))
+            c_ctx, p_ctx = d_ctx['centers'], d_ctx['patches']
+        else:
+            c_ctx = np.zeros((0, 3), dtype=np.float32)
+            p_ctx = np.zeros((0,) + p0.shape[1:], dtype=p0.dtype)
+        N_prev = len(c_ctx)
+        ids_ctx = np.zeros(N_prev, dtype=ids0.dtype)   # GT ids not needed for context
+
+        # ---- Inject phantom nodes into curr frame ----
         ph_list = list(phantom_pool.items())   # [(tid, ph_data), ...]
         P       = len(ph_list)
         ph_tids = [tid for tid, _ in ph_list]
@@ -333,36 +319,59 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
             c0_aug  = np.vstack([c0, ph_proj])
             p0_aug  = np.zeros((N0_real + P, *p0.shape[1:]), dtype=p0.dtype)
             p0_aug[:N0_real] = p0
-            # ids: phantoms get 0 (no GT id; labels not used at inference)
             ids0_aug = np.zeros(N0_real + P, dtype=ids0.dtype)
             ids0_aug[:N0_real] = ids0
         else:
             c0_aug, p0_aug, ids0_aug = c0, p0, ids0
 
-        N0 = len(c0_aug)
+        N_curr = len(c0_aug)   # N0_real + P
 
-        # ---- Build graph ----
-        edge_index, edge_feat, _, _ = _build_graph(
-            c0_aug, ids0_aug, c1, ids1, t, parents_gt, p2c_gt,
+        # ---- Build triplet graph [ctx (t-1), curr (t + phantoms), next (t+1)] ----
+        ids1_dummy = np.zeros(N1, dtype=ids0.dtype)
+        edge_index, edge_feat, _, _, _, _ = _build_triplet_graph(
+            c_ctx,  ids_ctx,
+            c0_aug, ids0_aug,
+            c1,     ids1_dummy,
+            t,      parents_gt, p2c_gt,
             cfg.r_intra, cfg.r_cross, cfg.z_anisotropy,
         )
         if edge_index.shape[1] == 0:
             det_track.pop(t, None)
             continue
 
-        all_c = np.vstack([c0_aug, c1]).astype(np.float32)
-        sc    = _scale(all_c, cfg.z_anisotropy)
-        ff    = np.array([0]*N0 + [1]*N1, dtype=np.float32)
-        pos   = np.column_stack([sc, ff]).astype(np.float32)
-        patches_all = np.concatenate([p0_aug, p1], axis=0)
+        # ---- Position encoding ----
+        N_total = N_prev + N_curr + N1
+        all_c   = np.vstack([c_ctx, c0_aug, c1]).astype(np.float32)
+        sc      = _scale(all_c, cfg.z_anisotropy)
+
+        if legacy:
+            # 4-D legacy: [z_sc, y, x, is_next]  (no ctx frame; curr=0, next=1)
+            pos = np.zeros((N_total, 4), dtype=np.float32)
+            pos[:, :3] = sc
+            pos[N_prev + N_curr:, 3] = 1.0            # next: is_next=1
+        else:
+            # 5-D triplet: [z_sc, y, x, is_prev, is_next]
+            pos = np.zeros((N_total, 5), dtype=np.float32)
+            pos[:, :3] = sc
+            pos[:N_prev, 3] = 1.0                     # ctx: is_prev=1
+            pos[N_prev + N_curr:, 4] = 1.0            # next: is_next=1
 
         # ---- Encode → override phantom rows → GNN + classify ----
-        h_cnn = model.encode(
-            torch.from_numpy(patches_all[:, :cfg.in_channels]).to(device),
-            torch.from_numpy(pos).to(device),
-        )
+        p0_sl  = p0_aug[:, :cfg.in_channels]
+        p1_sl  = p1[:, :cfg.in_channels]
+        p_ctx_sl = p_ctx[:, :cfg.in_channels] if N_prev > 0 else np.zeros((0,) + p0_sl.shape[1:], dtype=p0.dtype)
+        patches_all = np.concatenate([p_ctx_sl, p0_sl, p1_sl], axis=0)
+
+        patches_t = torch.from_numpy(patches_all).to(device)
+        pos_t     = torch.from_numpy(pos).to(device)
+        h_cnn_raw = model.encode_cnn(patches_t)              # CNN only (N_total, D)
+        h_cnn     = h_cnn_raw + model.pos_enc(pos_t)         # add pos enc
+
+        # Phantoms: stale CNN appearance + fresh pos_enc at projected position
         for ph_i, (_, ph) in enumerate(ph_list):
-            h_cnn[N0_real + ph_i] = ph['h_feat'].to(device)
+            g_idx     = N_prev + N0_real + ph_i
+            ph_pos_t  = pos_t[g_idx].unsqueeze(0)
+            h_cnn[g_idx] = ph['h_feat_cnn'].to(device) + model.pos_enc(ph_pos_t).squeeze(0)
 
         conn_logits, sister_logits, fg_logits = model.forward_from_features(
             h_cnn,
@@ -373,39 +382,46 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
         sister_scores = torch.sigmoid(sister_logits).cpu().numpy()
         fg_scores     = torch.sigmoid(fg_logits).cpu().numpy()
 
-        # FG filter: real nodes use threshold; phantom nodes always pass
-        ff_int = ff.astype(np.int32).copy()
-        ff_int[fg_scores < cfg.fg_threshold] = -1
-        for ph_i in range(P):
-            ff_int[N0_real + ph_i] = 0
+        # ---- FG filter (curr real nodes only) ----
+        # frame_flags: 0=ctx, 1=curr, 2=next
+        ff_int = np.zeros(N_total, dtype=np.int32)
+        ff_int[:N_prev]              = 0   # ctx
+        ff_int[N_prev:N_prev+N_curr] = 1   # curr (real + phantom)
+        ff_int[N_prev+N_curr:]       = 2   # next
+
+        for i in range(N_prev, N_prev + N0_real):
+            if fg_scores[i] < cfg.fg_threshold:
+                ff_int[i] = -1           # filtered out
+        # Phantom curr nodes always pass (already = 1)
 
         # ---- Clustering ----
-        cl0_g = intra_cluster(all_c, conn_scores, edge_index, ff_int, 0, cfg.intra_threshold)
-        cl1_g = intra_cluster(all_c, conn_scores, edge_index, ff_int, 1, cfg.intra_threshold)
+        cl0_g = intra_cluster(all_c, conn_scores, edge_index, ff_int, 1, cfg.intra_threshold)
+        cl1_g = intra_cluster(all_c, conn_scores, edge_index, ff_int, 2, cfg.intra_threshold,
+                              sister_scores=sister_scores, sister_suppress=sister_threshold)
 
         if not cl0_g or not cl1_g:
             det_track.pop(t, None)
             continue
 
-        cl0_loc = _cluster_local(cl0_g, 0)
-        cl1_loc = _cluster_local(cl1_g, N0)
+        # Local indices for per-frame arrays
+        cl0_loc = _cluster_local(cl0_g, N_prev)           # curr-local: [0, N_curr)
+        cl1_loc = _cluster_local(cl1_g, N_prev + N_curr)  # next-local: [0, N1)
         reps0   = cluster_representative(cl0_g, all_c)
         reps1   = cluster_representative(cl1_g, all_c)
 
-        # Global node index → phantom track ID (for phantom-containing clusters)
-        ph_node_to_tid = {N0_real + i: ph_tids[i] for i in range(P)}
+        # Global phantom index → track ID
+        ph_node_to_tid = {N_prev + N0_real + i: ph_tids[i] for i in range(P)}
 
-        # ---- Track IDs for frame-t clusters ----
+        # ---- Track IDs for curr clusters ----
         prev_track = det_track.get(t)
         new_track0 = np.zeros(N0_real, dtype=np.int32)
         cl0_tid    = []
         used_tids  = set()
 
         for k0, cl_loc in enumerate(cl0_loc):
-            # Phantom in this cluster overrides the track ID lookup
-            ph_tid = next(
-                (ph_node_to_tid[g] for g in cl_loc if g in ph_node_to_tid), 0
-            )
+            # Use global indices for phantom lookup
+            ph_tid = next((ph_node_to_tid[g] for g in cl0_g[k0]
+                           if g in ph_node_to_tid), 0)
             if ph_tid > 0:
                 tid = ph_tid
             elif prev_track is not None:
@@ -425,15 +441,16 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
 
         det_track[t] = new_track0
 
-        # Cache mean h_cnn per frame-t cluster (needed to create phantoms below)
-        cl0_h = {k0: h_cnn[list(cl)].mean(0).detach().cpu()
+        # Cache CNN-only features (no pos_enc) per curr cluster for phantom creation
+        cl0_h = {k0: h_cnn_raw[list(cl)].mean(0).detach().cpu()
                  for k0, cl in enumerate(cl0_g)}
 
         # ---- Affinity matrices ----
         aff        = cross_frame_scores(cl0_g, cl1_g, conn_scores, edge_index)
-        sister_mat = sister_cluster_scores(cl1_g, sister_scores, edge_index, N0)
+        sister_mat = sister_cluster_scores(cl1_g, sister_scores, edge_index,
+                                           N_prev + N_curr)
 
-        # ---- Match ----
+        # ---- Match curr → next ----
         assignments = match_cross_frame_simple(
             aff, sister_mat, cl0_g, cl1_g, reps0, reps1,
             cfg.cross_threshold, mitosis_threshold,
@@ -444,55 +461,46 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
         assigned_k0 = {k0 for k0, _ in assignments}
 
         # ---- Update phantom pool ----
-
-        # Phantoms whose cluster matched → track resumed, remove from pool
         for k0, _ in assignments:
             for node in cl0_g[k0]:
                 if node in ph_node_to_tid:
                     phantom_pool.pop(ph_node_to_tid[node], None)
 
-        # Phantoms that appeared in no cluster (filtered as BG or out of range)
-        # → decrement directly; they'll be cleaned up below
         ph_in_cluster = {ph_node_to_tid[n]
                          for cl in cl0_g for n in cl if n in ph_node_to_tid}
         for tid in list(phantom_pool):
             if tid not in ph_in_cluster and tid in [t2 for t2, _ in ph_list]:
                 phantom_pool[tid]['frames_remaining'] -= 1
 
-        # Unmatched clusters → create or update phantoms
         for k0 in range(len(cl0_g)):
             if k0 in assigned_k0:
                 continue
-            tid      = cl0_tid[k0]
-            pos_now  = reps0[k0].copy()
+            tid     = cl0_tid[k0]
+            pos_now = reps0[k0].copy()
 
             if tid in phantom_pool:
-                # Existing phantom still unmatched → update position, decrement
                 old_pos = phantom_pool[tid]['pos'].copy()
                 phantom_pool[tid]['pos']              = pos_now
                 phantom_pool[tid]['vel']              = pos_now - old_pos
                 phantom_pool[tid]['frames_remaining'] -= 1
             else:
-                # Real cluster ending → create new phantom
                 vel = pos_now - prev_track_reps.get(tid, pos_now)
                 phantom_pool[tid] = {
                     'pos': pos_now,
-                    'h_feat': cl0_h[k0],
+                    'h_feat_cnn': cl0_h[k0],
                     'vel': vel,
                     'frames_remaining': cfg.phantom_max_frames,
                 }
 
-        # Expire dead phantoms
         for tid in [tid for tid, ph in phantom_pool.items()
                     if ph['frames_remaining'] <= 0]:
             del phantom_pool[tid]
 
-        # Update velocity reference positions for next frame
         prev_track_reps = {cl0_tid[k0]: reps0[k0] for k0 in range(len(cl0_g))}
 
-        # ---- Assign track IDs to frame-(t+1) clusters ----
-        new_track1 = np.zeros(N1, dtype=np.int32)
-        matched_k1 = set()
+        # ---- Assign track IDs to next clusters ----
+        new_track1  = np.zeros(N1, dtype=np.int32)
+        matched_k1  = set()
 
         for k0, k1s in assignments:
             tid = cl0_tid[k0]
@@ -504,7 +512,6 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
                 frame_clusters[t + 1].append((tid, reps1[k1]))
                 matched_k1.add(k1)
             else:
-                # Division: parent ends at t, daughters start at t+1
                 track_meta[tid]['last'] = t
                 for k1 in k1s:
                     dtid = next_tid; next_tid += 1
@@ -527,7 +534,7 @@ def run_ctc_inference_simple(cfg, exp_id, ckpt_path, out_dir,
         if t % 20 == 0:
             n_mit = sum(1 for _, k1s in assignments if len(k1s) == 2)
             print(f'  pair {t:3d}/{n_frames-1}: '
-                  f'det={N0_real:3d}+{P}ph/{N1:3d}  '
+                  f'ctx={N_prev:3d}  det={N0_real:3d}+{P}ph/{N1:3d}  '
                   f'cl={len(cl0_g):3d}/{len(cl1_g):3d}  '
                   f'matched={len(assignments):3d}  mitoses={n_mit}  '
                   f'pool={len(phantom_pool)}')
@@ -581,20 +588,25 @@ if __name__ == '__main__':
     parser.add_argument('--exp',    default='0515')
     parser.add_argument('--ckpt',   default='cache/checkpoints_simple/best.pt')
     parser.add_argument('--out',    default=None)
-    parser.add_argument('--sister-threshold', type=float, default=0.5,
-                        help='sister score threshold for division detection (default 0.5)')
-    parser.add_argument('--mitosis-threshold', type=float, default=None,
-                        help='conn affinity threshold for each daughter (default: cfg.mitosis_threshold)')
-    parser.add_argument('--rz', type=int, default=3, help='ellipsoid Z radius (voxels)')
-    parser.add_argument('--ry', type=int, default=6, help='ellipsoid Y radius (voxels)')
-    parser.add_argument('--rx', type=int, default=6, help='ellipsoid X radius (voxels)')
+    parser.add_argument('--sister-threshold', type=float, default=0.5)
+    parser.add_argument('--mitosis-threshold', type=float, default=None)
+    parser.add_argument('--rz', type=int, default=3)
+    parser.add_argument('--ry', type=int, default=6)
+    parser.add_argument('--rx', type=int, default=6)
+    parser.add_argument('--legacy', action='store_true',
+                        help='Load old-architecture checkpoint (BatchNorm3d + 4-D pos enc)')
+    parser.add_argument('--no-phantom', action='store_true',
+                        help='Disable phantom nodes (set phantom_max_frames=0)')
     args = parser.parse_args()
 
     cfg = Config()
+    if args.no_phantom:
+        cfg.phantom_max_frames = 0
     if not os.path.isabs(args.ckpt):
         args.ckpt = os.path.join(cfg.data_root, args.ckpt)
     out = args.out or os.path.join(cfg.cache_dir, f'ctc_simple_{args.exp}')
     run_ctc_inference_simple(cfg, args.exp, args.ckpt, out,
                              sister_threshold=args.sister_threshold,
                              mitosis_threshold=args.mitosis_threshold,
-                             radius_zyx=(args.rz, args.ry, args.rx))
+                             radius_zyx=(args.rz, args.ry, args.rx),
+                             legacy=args.legacy)

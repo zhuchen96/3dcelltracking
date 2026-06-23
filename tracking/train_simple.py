@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import amp
 from torch.utils.data import DataLoader
 
 from tracking.config import Config
@@ -58,6 +59,7 @@ def focal_bce(logits, labels, valid, pos_weight, gamma=2.0):
 @torch.no_grad()
 def eval_edges(model, dataset, device, cfg):
     model.eval()
+    use_amp = device.type == 'cuda'
     tp = fp = fn = 0
     s_tp = s_fp = s_fn = 0
     for item in dataset:
@@ -70,7 +72,11 @@ def eval_edges(model, dataset, device, cfg):
         if edge_index.shape[1] == 0:
             continue
 
-        conn_logits, sister_logits, fg_logits = model(patches[:, :cfg.in_channels], positions, edge_index, edge_feat)
+        N_p, N_c, N_n = item['N_prev'], item['N_curr'], item['N_next']
+        h_raw = _encode_frames(model, patches[:, :cfg.in_channels],
+                               N_p, N_c, N_n, cfg.feat_dim, device, use_amp)
+        h_cnn = h_raw + model.pos_enc(positions)
+        conn_logits, sister_logits, fg_logits = model.forward_from_features(h_cnn, edge_index, edge_feat)
 
         valid = item['valid'].to(device)
         if valid.sum() > 0:
@@ -97,6 +103,19 @@ def eval_edges(model, dataset, device, cfg):
                 sister_p=sp, sister_r=sr, sister_f1=sf1)
 
 
+def _encode_frames(model, patches, N_p, N_c, N_n, feat_dim, device, use_amp):
+    """Encode CNN one frame at a time to cap the gradient-checkpoint recompute size."""
+    def _enc(p):
+        if p.shape[0] == 0:
+            return torch.zeros(0, feat_dim, device=device)
+        with amp.autocast('cuda', enabled=use_amp):
+            return model.encode_cnn(p)
+    h = torch.cat([_enc(patches[:N_p]),
+                   _enc(patches[N_p:N_p + N_c]),
+                   _enc(patches[N_p + N_c:])])
+    return h.float()
+
+
 def train(cfg: Config, run_name: str = 'default'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
@@ -111,10 +130,10 @@ def train(cfg: Config, run_name: str = 'default'):
         cfg.r_intra, cfg.r_cross, cfg.z_anisotropy,
         aug_drop_prob=0.0,
     )
-    print(f'Train pairs: {len(train_ds)},  Val pairs: {len(val_ds)}')
+    print(f'Train triplets: {len(train_ds)},  Val triplets: {len(val_ds)}')
 
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,
-                              collate_fn=collate_fn, num_workers=2)
+                              collate_fn=collate_fn, num_workers=0)
 
     model = SimpleTrackingNet(
         feat_dim=cfg.feat_dim,
@@ -142,10 +161,14 @@ def train(cfg: Config, run_name: str = 'default'):
     log_path = os.path.join(ckpt_dir, 'log.jsonl')
 
     best_combined = 0.0
+    use_amp = device.type == 'cuda'
+    scaler = amp.GradScaler('cuda', enabled=use_amp)
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         losses = []
+        if use_amp:
+            torch.cuda.empty_cache()
 
         for batch in train_loader:
             for item in batch:
@@ -159,7 +182,10 @@ def train(cfg: Config, run_name: str = 'default'):
                 labels_d    = item['labels'].to(device)
                 valid_d     = item['valid'].to(device)
 
-                h_cnn = model.encode(patches[:, :cfg.in_channels], positions)
+                N_p, N_c, N_n = item['N_prev'], item['N_curr'], item['N_next']
+                h_raw = _encode_frames(model, patches[:, :cfg.in_channels],
+                                       N_p, N_c, N_n, cfg.feat_dim, device, use_amp)
+                h_cnn = h_raw + model.pos_enc(positions)
                 conn_logits, sister_logits, fg_logits = model.forward_from_features(
                     h_cnn, edge_index, edge_feat)
 
@@ -183,9 +209,11 @@ def train(cfg: Config, run_name: str = 'default'):
                         + cfg.metric_loss_weight * m_loss)
                 if loss.requires_grad:
                     optim.zero_grad()
-                    loss.backward()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optim)
                     nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                    optim.step()
+                    scaler.step(optim)
+                    scaler.update()
                     losses.append(loss.item())
 
         sched.step()

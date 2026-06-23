@@ -13,6 +13,7 @@ For phantom-node inference, call encode() → override phantom rows → forward_
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -22,12 +23,13 @@ import torch.nn.functional as F
 class ResBlock3D(nn.Module):
     def __init__(self, ch):
         super().__init__()
+        groups = min(8, ch)
         self.net = nn.Sequential(
             nn.Conv3d(ch, ch, 3, padding=1, bias=False),
-            nn.BatchNorm3d(ch),
+            nn.GroupNorm(groups, ch),
             nn.ReLU(inplace=True),
             nn.Conv3d(ch, ch, 3, padding=1, bias=False),
-            nn.BatchNorm3d(ch),
+            nn.GroupNorm(groups, ch),
         )
 
     def forward(self, x):
@@ -35,34 +37,33 @@ class ResBlock3D(nn.Module):
 
 
 class Encoder3D(nn.Module):
-    """Input: (B, in_channels, pz, py, px)  →  Output: (B, feat_dim)
-    Channel 0: raw intensity.  Channel 1 (optional): exp(-det/5) detection probability."""
+    """Input: (B, in_channels, pz, py, px)  →  Output: (B, feat_dim)"""
 
     def __init__(self, feat_dim=128, in_channels=1):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv3d(in_channels, 32, 3, padding=1, bias=False),
-            nn.BatchNorm3d(32), nn.ReLU(inplace=True),
+            nn.GroupNorm(8, 32), nn.ReLU(inplace=True),
         )
         self.layer1 = nn.Sequential(ResBlock3D(32), nn.MaxPool3d(2))   # /2
         self.layer2 = nn.Sequential(
             nn.Conv3d(32, 64, 3, padding=1, bias=False),
-            nn.BatchNorm3d(64), nn.ReLU(inplace=True),
+            nn.GroupNorm(8, 64), nn.ReLU(inplace=True),
             ResBlock3D(64), nn.MaxPool3d(2),                            # /4
         )
         self.layer3 = nn.Sequential(
             nn.Conv3d(64, 128, 3, padding=1, bias=False),
-            nn.BatchNorm3d(128), nn.ReLU(inplace=True),
+            nn.GroupNorm(8, 128), nn.ReLU(inplace=True),
             ResBlock3D(128),
         )
         self.pool = nn.AdaptiveAvgPool3d(1)
         self.proj = nn.Linear(128, feat_dim)
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
+        x = checkpoint(self.stem,   x, use_reentrant=False)
+        x = checkpoint(self.layer1, x, use_reentrant=False)
+        x = checkpoint(self.layer2, x, use_reentrant=False)
+        x = checkpoint(self.layer3, x, use_reentrant=False)
         x = self.pool(x).flatten(1)
         return self.proj(x)
 
@@ -160,6 +161,88 @@ class ForegroundHead(nn.Module):
 # SimpleTrackingNet
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Legacy architecture (BatchNorm3d + pos_dim=4) for loading old checkpoints
+# ---------------------------------------------------------------------------
+
+class _LegacyResBlock3D(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm3d(ch), nn.ReLU(inplace=True),
+            nn.Conv3d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm3d(ch),
+        )
+
+    def forward(self, x):
+        return F.relu(x + self.net(x), inplace=True)
+
+
+class _LegacyEncoder3D(nn.Module):
+    def __init__(self, feat_dim=128, in_channels=1):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_channels, 32, 3, padding=1, bias=False),
+            nn.BatchNorm3d(32), nn.ReLU(inplace=True),
+        )
+        self.layer1 = nn.Sequential(_LegacyResBlock3D(32), nn.MaxPool3d(2))
+        self.layer2 = nn.Sequential(
+            nn.Conv3d(32, 64, 3, padding=1, bias=False),
+            nn.BatchNorm3d(64), nn.ReLU(inplace=True),
+            _LegacyResBlock3D(64), nn.MaxPool3d(2),
+        )
+        self.layer3 = nn.Sequential(
+            nn.Conv3d(64, 128, 3, padding=1, bias=False),
+            nn.BatchNorm3d(128), nn.ReLU(inplace=True),
+            _LegacyResBlock3D(128),
+        )
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.proj = nn.Linear(128, feat_dim)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.pool(x).flatten(1)
+        return self.proj(x)
+
+
+class LegacySimpleTrackingNet(nn.Module):
+    """Old architecture: BatchNorm3d encoder + 4-D positional encoding.
+    Used to load checkpoints trained before the GroupNorm/triplet migration."""
+
+    def __init__(self, feat_dim=128, gnn_layers=2, edge_dim=4, in_channels=1):
+        super().__init__()
+        self.encoder     = _LegacyEncoder3D(feat_dim, in_channels=in_channels)
+        self.pos_enc     = nn.Linear(4, feat_dim)
+        self.fg_head     = ForegroundHead(feat_dim)
+        self.gnn         = nn.ModuleList(
+            [MPNNLayer(feat_dim, edge_dim) for _ in range(gnn_layers)]
+        )
+        self.classifier  = EdgeClassifier(feat_dim, edge_dim)
+        self.sister_head = EdgeClassifier(feat_dim, edge_dim)
+
+    def encode_cnn(self, patches):
+        return self.encoder(patches)
+
+    def forward_from_features(self, h_cnn, edge_index, edge_feat):
+        fg_logits = self.fg_head(h_cnn)
+        h = h_cnn
+        for i, layer in enumerate(self.gnn):
+            if i == 0 or edge_index.shape[1] == 0:
+                h = layer(h, edge_index, edge_feat)
+            else:
+                with torch.no_grad():
+                    prelim = torch.sigmoid(self.classifier(h, edge_index, edge_feat))
+                mask = prelim > 0.3
+                h = layer(h, edge_index[:, mask], edge_feat[mask])
+        return self.classifier(h, edge_index, edge_feat), \
+               self.sister_head(h, edge_index, edge_feat), \
+               fg_logits
+
+
 class SimpleTrackingNet(nn.Module):
     """
     Simplified tracking network with score-gated message passing.
@@ -172,7 +255,7 @@ class SimpleTrackingNet(nn.Module):
     be injected: call encode() → override phantom rows in h_cnn → forward_from_features().
     """
 
-    def __init__(self, feat_dim=128, gnn_layers=2, edge_dim=4, pos_dim=4, in_channels=1):
+    def __init__(self, feat_dim=128, gnn_layers=2, edge_dim=4, pos_dim=5, in_channels=1):
         super().__init__()
         self.encoder     = Encoder3D(feat_dim, in_channels=in_channels)
         self.pos_enc     = nn.Linear(pos_dim, feat_dim)
@@ -183,9 +266,13 @@ class SimpleTrackingNet(nn.Module):
         self.classifier  = EdgeClassifier(feat_dim, edge_dim)
         self.sister_head = EdgeClassifier(feat_dim, edge_dim)
 
+    def encode_cnn(self, patches):
+        """CNN encoder only, without positional encoding. Cache this for phantom nodes."""
+        return self.encoder(patches)
+
     def encode(self, patches, positions):
         """CNN encoder + positional encoding → pre-GNN node features (N, D)."""
-        return self.encoder(patches) + self.pos_enc(positions)
+        return self.encode_cnn(patches) + self.pos_enc(positions)
 
     def forward_from_features(self, h_cnn, edge_index, edge_feat):
         """
